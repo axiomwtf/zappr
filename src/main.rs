@@ -6,7 +6,6 @@ mod config;
 mod deps;
 mod fmt;
 mod font8x8;
-mod gui;
 mod interp;
 mod lexer;
 mod linker;
@@ -64,7 +63,7 @@ fn cmd_custom(cmd: &str, rest: &[String]) -> Result<(), String> {
     if !yaml.exists() {
         return Err(format!("unknown command `{cmd}` — see `zap --help`"));
     }
-    let p = project::load(&cwd, false)?;
+    let p = std::sync::Arc::new(project::load(&cwd, false)?);
     if p.config.cli.is_empty() {
         return Err(format!("unknown command `{cmd}` — see `zap --help`"));
     }
@@ -114,7 +113,7 @@ fn cmd_new(rest: &[String]) -> Result<(), String> {
 
 fn cmd_run(rest: &[String]) -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let p = project::load(&cwd, false)?;
+    let p = std::sync::Arc::new(project::load(&cwd, false)?);
     let mut vm = project::vm_for(&p)?;
     // argv for args.* (§9.5): everything after `--`, else all of rest
     let args: Vec<String> = if let Some(i) = rest.iter().position(|a| a == "--") {
@@ -132,7 +131,7 @@ fn cmd_run(rest: &[String]) -> Result<(), String> {
 fn cmd_build(rest: &[String]) -> Result<(), String> {
     // target selection: flag > Zappr.yaml targets > host
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let p = project::load(&cwd, false)?;
+    let p = std::sync::Arc::new(project::load(&cwd, false)?);
     let release = rest.iter().any(|a| a == "--release" || a == "-r");
     let target = rest
         .iter()
@@ -162,7 +161,7 @@ fn cmd_check(_rest: &[String]) -> Result<(), String> {
 fn cmd_test(_rest: &[String]) -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     // tests live in zap/tests/ — load everything including tests
-    let p = project::load(&cwd, true)?;
+    let p = std::sync::Arc::new(project::load(&cwd, true)?);
     let mut vm = project::vm_for(&p)?;
     // run test.znz's entry: prefer `test`, then `main`, in the testsTest module
     for entry in ["testsTest.test", "testsTest.main", "test", "main"] {

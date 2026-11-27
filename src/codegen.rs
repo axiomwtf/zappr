@@ -68,7 +68,7 @@ pub fn build(p: &Project, vm: &mut Vm, target: &str, release: bool) -> Result<()
 }
 
 /// dist/{debug|release}/<name>[.exe|.wasm] under the project root (§18.1)
-fn artifact_paths(p: &Project, target: &str, release: bool) -> (PathBuf, PathBuf) {
+pub(crate) fn artifact_paths(p: &Project, target: &str, release: bool) -> (PathBuf, PathBuf) {
     let name = p.config.name.clone().unwrap_or_else(|| "app".into());
     let safe: String = name
         .chars()

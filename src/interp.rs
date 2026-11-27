@@ -46,6 +46,9 @@ pub struct Vm {
     cur_line: usize,
     /// argv for the running program / custom cli command (§9.5)
     pub cli_args: Vec<String>,
+    /// owning project (set by vm_for) — lets ui.run hand off to the
+    /// compiled native renderer (§16)
+    pub project: Option<std::sync::Arc<crate::project::Project>>,
 }
 
 #[derive(Debug)]
@@ -78,6 +81,7 @@ impl Vm {
             ui: crate::uiruntime::UiRuntime::new(),
             cur_line: 0,
             cli_args: Vec::new(),
+            project: None,
         }
     }
 
@@ -1967,27 +1971,49 @@ impl Vm {
             ))),
             "ui.window" => Ok(Some(self.ui.window(&args))),
             "ui.run" => {
-                // native renderer when a display exists (§16); headless tick otherwise
-                let mut ui = std::mem::take(&mut self.ui);
-                let mut rendered = false;
+                // ui.run hands off to the compiled native renderer (§16):
+                // build the linux artifact (content-cached) and exec it,
+                // so `zap run` and `zap build` share one Wayland backend.
                 #[cfg(unix)]
                 {
-                    if let Ok(Some(mut app)) = crate::gui::open(&ui) {
-                        rendered = true;
-                        let _ = crate::gui::run(&mut app, &ui, &mut |f| {
-                            self.call_func_value(&f, vec![])
-                                .map(|_| ())
-                                .map_err(|e| e.msg)
-                        });
+                    if let Some(p) = self.project.clone() {
+                        if let Err(e) = crate::codegen::build(&p, self, "linux", false) {
+                            return Err(RuntimeError { msg: e, line: self.cur_line });
+                        }
+                        let (out, _) = crate::codegen::artifact_paths(&p, "linux", false);
+                        use std::os::unix::process::CommandExt;
+                        let args: Vec<String> = self.cli_args.clone();
+                        let err = std::process::Command::new(&out)
+                            .args(&args)
+                            .exec();
+                        return Err(RuntimeError { msg: format!("cannot exec {}: {err}", out.display()), line: self.cur_line });
                     }
                 }
-                if !rendered {
-                    for w in &ui.windows {
-                        let mut el = w.borrow_mut();
-                        if el.dirty {
-                            el.dirty = false;
-                            ui.frame += 1;
+                #[cfg(not(unix))]
+                {
+                    if let Some(p) = self.project.clone() {
+                        if let Err(e) = crate::codegen::build(&p, self, "windows", false) {
+                            return Err(RuntimeError { msg: e, line: self.cur_line });
                         }
+                        let (out, _) = crate::codegen::artifact_paths(&p, "windows", false);
+                        let args: Vec<String> = self.cli_args.clone();
+                        return match std::process::Command::new(&out).args(&args).status() {
+                            Ok(st) => Ok(Some(Value::Int(st.code().unwrap_or(1) as i64))),
+                            Err(e2) => Err(RuntimeError {
+                                msg: format!("cannot run {}: {e2}", out.display()),
+                                line: self.cur_line,
+                            }),
+                        };
+                    }
+                }
+                // headless fallback only reachable when the interpreter is
+                // driven without a project (tests); real runs hand off above
+                let mut ui = std::mem::take(&mut self.ui);
+                for w in &ui.windows {
+                    let mut el = w.borrow_mut();
+                    if el.dirty {
+                        el.dirty = false;
+                        ui.frame += 1;
                     }
                 }
                 self.ui = ui;

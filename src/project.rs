@@ -180,8 +180,9 @@ pub fn find_root(dir: &Path) -> Result<PathBuf, String> {
 }
 
 /// Build a Vm from a loaded project: registers all modules, sets zapYaml.
-pub fn vm_for(p: &Project) -> Result<Vm, String> {
+pub fn vm_for(p: &std::sync::Arc<Project>) -> Result<Vm, String> {
     let mut vm = Vm::new();
+    vm.project = Some(p.clone());
     for (mname, _, prog) in &p.modules {
         vm.load_module(mname, prog)
             .map_err(|e| format!("load error in module `{mname}`: {}", e.msg))?;
