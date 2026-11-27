@@ -122,6 +122,15 @@ static ZVal z_method(ZVal obj, const char *path, ZVal *args, int n, ZEnv *env);
 static void z_ui_render(ZUi *u, int depth);
 
 static ZEnv *z_global;
+/* shortest round-trip float formatting (matches interp's Display) */
+static void z_fmt_float_shortest(char *buf, size_t n, double v) {
+  for (int p = 1; p <= 17; p++) {
+    snprintf(buf, n, "%.*g", p, v);
+    if (strtod(buf, NULL) == v) return;
+  }
+  snprintf(buf, n, "%.17g", v);
+}
+
 static void z_die(const char *msg) {
   fprintf(stderr, "zap: runtime error: %s\n", msg);
   exit(1);
@@ -426,7 +435,7 @@ static void sb_val(ZSb *b, ZVal v) {
     case Z_INT: snprintf(tmp, sizeof tmp, "%lld", v.u.i); sb_add(b, tmp); break;
     case Z_FLOAT:
       if (isfinite(v.u.f) && floor(v.u.f) == v.u.f) snprintf(tmp, sizeof tmp, "%.1f", v.u.f);
-      else snprintf(tmp, sizeof tmp, "%.17g", v.u.f);
+      else z_fmt_float_shortest(tmp, sizeof tmp, v.u.f);
       sb_add(b, tmp); break;
     case Z_STR: sb_add(b, v.u.s); break;
     case Z_BOOL: sb_add(b, v.u.b ? "true" : "false"); break;
@@ -665,17 +674,18 @@ static ZVal z_ne_num(ZVal a, ZVal b) { return z_ne(a, b); }
 /* ---------- index / field ---------- */
 static ZVal z_index(ZVal v, long long i) {
   v = z_unwrap(v);
+  if (i < 0) i = 0; /* interp parity: negative indices clamp to 0 */
   if ((v.tag == Z_TUPLE || v.tag == Z_LIST) && v.u.vec) {
-    if (i >= 0 && (size_t)i < v.u.vec->n) return v.u.vec->v[i];
+    if ((size_t)i < v.u.vec->n) return v.u.vec->v[i];
     return ZNOTHING;
   }
   if (v.tag == Z_STR) {
     size_t len = strlen(v.u.s);
-    if (i >= 0 && (size_t)i < len) return z_strn(v.u.s + i, 1);
+    if ((size_t)i < len) return z_strn(v.u.s + i, 1);
     return ZNOTHING;
   }
   if (v.tag == Z_REC && v.u.rec) {
-    if (i >= 0 && (size_t)i < v.u.rec->n) return v.u.rec->vals[i];
+    if ((size_t)i < v.u.rec->n) return v.u.rec->vals[i];
     return ZNOTHING;
   }
   return z_errv("cannot index value", "index");
@@ -1402,7 +1412,7 @@ static void z_json_val(ZSb *b, ZVal v) {
   v = z_unwrap(v);
   switch (v.tag) {
     case Z_INT: { char t[32]; snprintf(t, sizeof t, "%lld", v.u.i); sb_add(b, t); break; }
-    case Z_FLOAT: { char t[64]; snprintf(t, sizeof t, "%.17g", v.u.f); sb_add(b, t); break; }
+    case Z_FLOAT: { char t[64]; z_fmt_float_shortest(t, sizeof t, v.u.f); sb_add(b, t); break; }
     case Z_BOOL: sb_add(b, v.u.b ? "true" : "false"); break;
     case Z_NOTHING: sb_add(b, "null"); break;
     case Z_STR: z_json_str(b, v); break;
@@ -1793,7 +1803,7 @@ static ZVal z_builtin_named(const char *name, ZVal *pos, int npos, ZVal named, Z
     return a;
   }
   if (!strcmp(name, "math.min") || !strcmp(name, "math.max")) {
-    int ismin = name[5] == 'i';
+    int ismin = name[6] == 'i';
     double best = ismin ? 1e300 : -1e300; int any = 0;
     for (int i = 0; i < npos; i++) {
       ZVal a = z_unwrap(pos[i]);
@@ -1859,6 +1869,7 @@ static ZVal z_builtin_named(const char *name, ZVal *pos, int npos, ZVal named, Z
   }
   if (!strcmp(name, "typeof")) {
     if (!npos) return z_str("nothing");
+    if (pos[0].tag == Z_WEAK) return z_str("any");
     ZVal v = z_unwrap(pos[0]);
     if (v.tag == Z_TYPE) return z_str(v.u.tname);
     return z_str(z_tag_name(v.tag));

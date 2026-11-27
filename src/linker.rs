@@ -39,7 +39,7 @@ fn check_magic_and_signature(data: &[u8]) -> Result<(), String> {
     let mut spki = Vec::with_capacity(44);
     spki.extend_from_slice(&ED25519_SPKI_PREFIX);
     spki.extend_from_slice(pk_raw);
-    let dir = std::env::temp_dir();
+    let dir = scratch_dir();
     let tag = format!("zapverify-{}", std::process::id());
     let key = dir.join(format!("{tag}.der"));
     let msg = dir.join(format!("{tag}.msg"));
@@ -88,7 +88,7 @@ pub fn sign(payload: &[u8], key: Option<&Path>) -> Result<Vec<u8>, String> {
     };
     let pk_raw = pubkey_raw(&key)?;
 
-    let dir = std::env::temp_dir();
+    let dir = scratch_dir();
     let tag = format!("zapsign-{}", std::process::id());
     let msg = dir.join(format!("{tag}.msg"));
     let sig = dir.join(format!("{tag}.sig"));
@@ -120,6 +120,14 @@ pub fn sign(payload: &[u8], key: Option<&Path>) -> Result<Vec<u8>, String> {
     out_b.extend_from_slice(&pk_raw);
     out_b.extend_from_slice(&sig_bytes);
     Ok(out_b)
+}
+
+fn scratch_dir() -> PathBuf {
+    let base = std::env::var("XDG_CACHE_HOME").map(PathBuf::from).ok()
+        .or_else(|| std::env::var("HOME").map(|h| PathBuf::from(h).join(".cache")).ok());
+    let d = base.unwrap_or_else(std::env::temp_dir).join("zap").join("build");
+    let _ = std::fs::create_dir_all(&d);
+    d
 }
 
 fn key_path() -> PathBuf {
