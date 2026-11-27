@@ -41,6 +41,15 @@ pub struct CGen<'a> {
     lambda_count: usize,
     /// emit-order lambda id counter
     lambda_seq: usize,
+    /// total `parallel {}` branches (synthetic fn prototypes)
+    par_count: usize,
+    /// emit-order parallel branch id counter
+    par_seq: usize,
+    /// deferred bodies of parallel branch fns
+    par_defs: String,
+    /// (child env, thread) pairs awaiting join inside the current
+    /// `parallel {}` emission
+    par_joins: Vec<(String, String)>,
     tmp_n: usize,
     loop_n: usize,
     /// loop break/continue label stack
@@ -71,6 +80,10 @@ pub fn emit(project: &Project, reachable: &HashSet<String>) -> Result<String, St
         fn_params: HashMap::new(),
         lambda_count: 0,
         lambda_seq: 0,
+        par_count: 0,
+        par_seq: 0,
+        par_defs: String::new(),
+        par_joins: Vec::new(),
         tmp_n: 0,
         loop_n: 0,
         loop_labels: Vec::new(),
@@ -82,7 +95,7 @@ pub fn emit(project: &Project, reachable: &HashSet<String>) -> Result<String, St
         lambda_defs: String::new(),
     };
     g.collect_symbols();
-    g.prescan_lambdas();
+    g.prescan_counts();
     let src = g.generate(project);
     if !g.errors.is_empty() {
         return Err(format!("codegen:\n  {}", g.errors.join("\n  ")));
@@ -118,15 +131,18 @@ impl<'a> CGen<'a> {
         }
     }
 
-    /// Count `Expr::Callback` occurrences in emit order so lambda ids in the
-    /// fn table match the definitions emitted later.
-    fn prescan_lambdas(&mut self) {
+    /// Pre-scan reachable fn bodies in emit order, counting `Expr::Callback`
+    /// nodes (lambda fn table size + ids) and `parallel {}` branches
+    /// (synthetic pthread fn prototypes).
+    fn prescan_counts(&mut self) {
         for (m, prog) in &self.modules {
             for item in &prog.items {
                 if let Item::Fn { name, body, .. } = item {
                     let q = format!("{m}.{name}");
                     if self.reachable.contains(&q) {
-                        count_callbacks(body, &mut self.lambda_count);
+                        for s in body {
+                            count_all_stmt(s, &mut self.lambda_count, &mut self.par_count);
+                        }
                     }
                 }
             }
@@ -152,6 +168,10 @@ impl<'a> CGen<'a> {
         }
         for i in 0..self.lambda_count {
             let _ = writeln!(s, "static ZVal zf_lambda{i}(ZEnv *cap, ZVal *args, int nargs, int supplied);");
+        }
+        for i in 0..self.par_count {
+            let _ = writeln!(s, "static ZVal z_par{i}(ZEnv *env);");
+            let _ = writeln!(s, "static void *z_parw{i}(void *p);");
         }
         // fn table
         s.push_str("ZFnEnt z_fns[] = {\n");
@@ -192,6 +212,7 @@ impl<'a> CGen<'a> {
                 }
             }
         }
+        s.push_str(&self.par_defs);
         s.push_str(&self.lambda_defs);
         s.push_str(&zap_init(project));
         s.push_str(&MAIN_C);
@@ -428,9 +449,40 @@ impl<'a> CGen<'a> {
                 let _ = writeln!(s, "{{ z_ret = {ex}; goto z_done; }}");
             }
             Stmt::Parallel { body, .. } => {
-                // sequential here; decls publish upward (§14) — emit inline
-                for st in body {
-                    self.emit_stmt(s, st, ind);
+                // structured concurrency (§14): each top-level stmt is a
+                // child task on its own thread with a child env; decls are
+                // absorbed back into `env` at the join, in branch order.
+                // No orphans — every thread is joined before continuing.
+                let penv = self.tmp("penv");
+                let base = self.par_seq;
+                self.par_seq += body.len();
+                self.ind(s, ind);
+                let _ = writeln!(s, "{{ ZEnv *{penv} = env;");
+                // spawn all children first, then join — true concurrency
+                for (i, _) in body.iter().enumerate() {
+                    let zc = self.tmp("zc");
+                    let zt = self.tmp("zt");
+                    self.ind(s, ind + 1);
+                    let _ = writeln!(s, "ZEnv *{zc} = z_env_new({penv}); pthread_t {zt};");
+                    self.ind(s, ind + 1);
+                    let _ = writeln!(
+                        s,
+                        "pthread_create(&{zt}, NULL, z_parw{}, (void*){zc});",
+                        base + i
+                    );
+                    self.par_joins.push((zc, zt));
+                }
+                let joins = std::mem::take(&mut self.par_joins);
+                for (zc, zt) in &joins {
+                    self.ind(s, ind + 1);
+                    let _ = writeln!(s, "pthread_join({zt}, NULL); z_env_absorb({penv}, {zc});");
+                }
+                self.ind(s, ind);
+                s.push_str("}\n");
+                // emit branch bodies now — keeps lambda numbering in
+                // prescan traversal order
+                for (i, st) in body.iter().enumerate() {
+                    self.emit_par_fn(base + i, st);
                 }
             }
             Stmt::Spawn(e) => {
@@ -1047,6 +1099,39 @@ impl<'a> CGen<'a> {
         }
     }
 
+    /// Emit one `parallel {}` branch as a synthetic fn + pthread wrapper.
+    /// `cap` IS the branch's child env (created at the parallel site), so
+    /// top-level decls land there and are absorbed at the join.
+    fn emit_par_fn(&mut self, lid: usize, st: &Stmt) {
+        let mut s = String::new();
+        let _ = writeln!(s, "\nstatic ZVal z_par{lid}(ZEnv *cap) {{");
+        s.push_str("  ZEnv *env = cap;\n");
+        s.push_str("  ZVal z_ret = ZNOTHING;\n");
+        let saved_locals = std::mem::take(&mut self.locals);
+        let saved_labels = std::mem::take(&mut self.loop_labels);
+        let saved_tmp = self.tmp_n;
+        let saved_loop = self.loop_n;
+        let saved_cur = self.cur_fn_q.clone();
+        self.locals = ["args".to_string()].into_iter().collect();
+        collect_decl_names(std::slice::from_ref(st), &mut self.locals);
+        self.loop_labels = Vec::new();
+        self.tmp_n = 0;
+        self.loop_n = 0;
+        self.cur_fn_q = format!("parallel{lid}");
+        self.emit_stmt(&mut s, st, 1);
+        let _ = writeln!(s, "z_done: return z_ret; }}\n");
+        let _ = writeln!(
+            s,
+            "static void *z_parw{lid}(void *p) {{ z_par{lid}((ZEnv*)p); return NULL; }}\n"
+        );
+        self.par_defs.push_str(&s);
+        self.locals = saved_locals;
+        self.loop_labels = saved_labels;
+        self.tmp_n = saved_tmp;
+        self.loop_n = saved_loop;
+        self.cur_fn_q = saved_cur;
+    }
+
     // ---------- lambdas ----------
 
     fn emit_lambda_def(&mut self, lid: usize, body: &[Stmt]) {
@@ -1165,115 +1250,112 @@ fn fuse(parts: &[String]) -> String {
 }
 
 /// Pre-scan: count Expr::Callback nodes in traversal order (matches emit).
-fn count_callbacks(body: &[Stmt], n: &mut usize) {
-    for s in body {
-        count_callbacks_stmt(s, n);
-    }
-}
 
-fn count_callbacks_stmt(s: &Stmt, n: &mut usize) {
+
+fn count_all_stmt(s: &Stmt, lambdas: &mut usize, pars: &mut usize) {
     match s {
-        Stmt::Decl { init, .. } => count_callbacks_expr(init, n),
-        Stmt::DeclTuple { init, .. } => count_callbacks_expr(init, n),
+        Stmt::Decl { init, .. } => count_all_expr(init, lambdas, pars),
+        Stmt::DeclTuple { init, .. } => count_all_expr(init, lambdas, pars),
         Stmt::Reassign { value, .. } => {
             if let Some(v) = value {
-                count_callbacks_expr(v, n);
+                count_all_expr(v, lambdas, pars);
             }
         }
-        Stmt::ReassignField { value, .. } => count_callbacks_expr(value, n),
-        Stmt::Expr(e) => count_callbacks_expr(e, n),
+        Stmt::ReassignField { value, .. } => count_all_expr(value, lambdas, pars),
+        Stmt::Expr(e) => count_all_expr(e, lambdas, pars),
         Stmt::If { cond, then_body, else_body, .. } => {
-            count_callbacks_expr(cond, n);
+            count_all_expr(cond, lambdas, pars);
             for s in then_body {
-                count_callbacks_stmt(s, n);
+                count_all_stmt(s, lambdas, pars);
             }
             if let Some(eb) = else_body {
                 for s in eb {
-                    count_callbacks_stmt(s, n);
+                    count_all_stmt(s, lambdas, pars);
                 }
             }
         }
         Stmt::ForIn { iter, body, .. }
         | Stmt::ForCond { cond: iter, body, .. } => {
-            count_callbacks_expr(iter, n);
+            count_all_expr(iter, lambdas, pars);
             for s in body {
-                count_callbacks_stmt(s, n);
+                count_all_stmt(s, lambdas, pars);
             }
         }
         Stmt::ForInfinite { body, .. } => {
             for s in body {
-                count_callbacks_stmt(s, n);
+                count_all_stmt(s, lambdas, pars);
             }
         }
         Stmt::ForCStyle { init, cond, post, body, .. } => {
             for s in init.iter().chain(post.iter()) {
-                count_callbacks_stmt(s, n);
+                count_all_stmt(s, lambdas, pars);
             }
-            count_callbacks_expr(cond, n);
+            count_all_expr(cond, lambdas, pars);
             for s in body {
-                count_callbacks_stmt(s, n);
+                count_all_stmt(s, lambdas, pars);
             }
         }
         Stmt::Match { expr, arms, .. } => {
-            count_callbacks_expr(expr, n);
+            count_all_expr(expr, lambdas, pars);
             for a in arms {
                 for s in &a.body {
-                    count_callbacks_stmt(s, n);
+                    count_all_stmt(s, lambdas, pars);
                 }
             }
         }
-        Stmt::Return(e) | Stmt::Spawn(e) => count_callbacks_expr(e, n),
+        Stmt::Return(e) | Stmt::Spawn(e) => count_all_expr(e, lambdas, pars),
         Stmt::Parallel { body, .. } => {
+            *pars += body.len();
             for s in body {
-                count_callbacks_stmt(s, n);
+                count_all_stmt(s, lambdas, pars);
             }
         }
         Stmt::Break | Stmt::Continue | Stmt::Use(_) => {}
     }
 }
 
-fn count_callbacks_expr(e: &Expr, n: &mut usize) {
+fn count_all_expr(e: &Expr, lambdas: &mut usize, pars: &mut usize) {
     match e {
         Expr::Callback { call, body } => {
-            *n += 1;
-            count_callbacks_expr(call, n);
+            *lambdas += 1;
+            count_all_expr(call, lambdas, pars);
             for s in body {
-                count_callbacks_stmt(s, n);
+                count_all_stmt(s, lambdas, pars);
             }
         }
         Expr::Call { callee, args } => {
-            count_callbacks_expr(callee, n);
+            count_all_expr(callee, lambdas, pars);
             for a in args {
-                count_callbacks_expr(a, n);
+                count_all_expr(a, lambdas, pars);
             }
         }
         Expr::Str(parts) => {
             for p in parts {
                 if let StrPart::Interp(ie) = p {
-                    count_callbacks_expr(ie, n);
+                    count_all_expr(ie, lambdas, pars);
                 }
             }
         }
         Expr::Tuple(es) | Expr::List(es) => {
             for e in es {
-                count_callbacks_expr(e, n);
+                count_all_expr(e, lambdas, pars);
             }
         }
         Expr::Map(kvs) => {
             for (k, v) in kvs {
-                count_callbacks_expr(k, n);
-                count_callbacks_expr(v, n);
+                count_all_expr(k, lambdas, pars);
+                count_all_expr(v, lambdas, pars);
             }
         }
-        Expr::Field { obj, .. } => count_callbacks_expr(obj, n),
-        Expr::Unary { expr, .. } => count_callbacks_expr(expr, n),
+        Expr::Field { obj, .. } => count_all_expr(obj, lambdas, pars),
+        Expr::Unary { expr, .. } => count_all_expr(expr, lambdas, pars),
         Expr::Binary { l, r, .. } => {
-            count_callbacks_expr(l, n);
-            count_callbacks_expr(r, n);
+            count_all_expr(l, lambdas, pars);
+            count_all_expr(r, lambdas, pars);
         }
-        Expr::Cast { expr, .. } | Expr::CountOf(expr) => count_callbacks_expr(expr, n),
+        Expr::Cast { expr, .. } | Expr::CountOf(expr) => count_all_expr(expr, lambdas, pars),
         Expr::DeclArg { .. } | Expr::RecordType { .. } => {}
-        Expr::NamedArg { value, .. } => count_callbacks_expr(value, n),
+        Expr::NamedArg { value, .. } => count_all_expr(value, lambdas, pars),
         _ => {}
     }
 }

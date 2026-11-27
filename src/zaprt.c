@@ -370,6 +370,12 @@ static int z_env_set(ZEnv *e, const char *name, ZVal v) {
   z_env_define(e, name, v);
   return 0;
 }
+/* parallel join (§14): publish a child env's top-level bindings into the
+   parent env. Values are shared ZVals (arena — no copy needed). */
+static void z_env_absorb(ZEnv *parent, ZEnv *child) {
+  for (ZBind *b = child->binds; b; b = b->next)
+    z_env_define(parent, b->name, b->ref->v);
+}
 static ZVal z_args_record(int supplied, ZVec *rest, int consumed) {
   /* args = {count: supplied, rest: list(rest)} — consumed params already bound */
   ZVal rec = z_rec_new("args");
