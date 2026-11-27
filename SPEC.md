@@ -285,8 +285,49 @@ Flat, verb-first:
 | `read(int age)` | declare-and-read, whitespace-delimited; bad input fails loudly |
 | `readInto(x)` | read into an existing variable |
 | `readDialogue(str name)` | prints `>: ` prompt, reads the full line |
+| `args.list()` | raw argv as `List(str)` — program name excluded |
+| `args.opts(defaults?)` | parsed options as a map, overlaid on `defaults` (§9.5) |
+| `args.positional()` | non-option arguments, in order |
 
 **Interpolation is a string-literal feature, not a print feature.** `{expr}` in *any* string literal interpolates from the enclosing scope, compile-time checked — `label.text = "count is {count}"` (§16.1) is the same machinery as `print.fmt`, which is just the flat verb for printing one.
+
+### 9.5 Native arg parsing
+
+Arg parsing is built in — no clap, no builder ceremony, no derive macros. `args` is an ambient namespace of three verbs; the result is ordinary values you already know how to handle.
+
+```go
+main() {
+  !o    = args.opts({name: "world", verbose: false})
+  !rest = args.positional()        /// ["deploy", "prod"] — order preserved
+  !raw  = args.list()              /// ["deploy", "--name", "world", "prod"]
+
+  print.nl("deploying {o.name} {rest}")
+  if o.verbose == true { print.nl("loud") }
+}
+```
+
+`zap app deploy prod --name world --verbose --out=a.txt`
+
+The grammar is deliberately tiny — everything clap does that you actually use, nothing it does that you don't:
+
+| Form | Meaning |
+|------|---------|
+| `--name value` | option with a value |
+| `--name=value` | same, one token |
+| `-n value` | short option, single dash |
+| `--flag` | boolean option, value `true` |
+| `-f` | short boolean flag |
+| `--` | everything after is positional, verbatim |
+| `-` alone, `--x` inside a value | positional, untouched |
+
+Rules:
+
+- **No schema, no registration.** There is no `Arg::new("name")` to forget. `args.opts()` parses what it sees; unknown options land in the map like known ones. Whether an option *should* exist is app policy.
+- **Defaults are just a map.** `args.opts({name: "world"})` is clap's `default_value` without the ceremony — parsed options overlay the defaults map, so `o.name` is always there. Without defaults, an absent option reads as the null side of the pad (§7.5) and surfaces through the same §8.1 machinery as every other optional.
+- **Values are strings, flags are bools.** `--out a.txt` gives `o.out == "a.txt"`; `--verbose` gives `o.verbose == true`. Repeating an option keeps the last value — silent overwrite is data, not misinterpretation.
+- **`args.positional()` and `args.opts()` partition `args.list()`.** Every token lands somewhere exactly once; nothing is dropped, reordered, or guessed.
+- **Custom zap CLI commands get the same `args`.** `zap stamp --build 3` parses `--build 3` inside `stamp()` exactly as a built binary would — one parser, one grammar, everywhere args exist.
+- Parsing is native and allocation-light: one pass over argv, no regex, no reflection, no proc macros — it fits the §21 budget trivially.
 
 ---
 
@@ -642,6 +683,8 @@ stamp() {
   val.builtAt = clock.nowIso()
 }
 ```
+
+Anything after the command name is that command's argv — `zap stamp --build 3` parses through the same `args.*` verbs as a built binary (§9.5).
 
 - Code consts (PascalCase in `.znz`) are truly immutable; `val:` entries are immutable at runtime and mutable only by a custom zap CLI at build time.
 
