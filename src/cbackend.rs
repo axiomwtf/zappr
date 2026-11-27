@@ -888,6 +888,24 @@ impl<'a> CGen<'a> {
     }
 
     fn emit_call(&mut self, callee: &Expr, args: &[Expr]) -> String {
+        // `read(Ty name, ...)` — declare-and-read: eval the DeclArg exprs
+        // for their define+parse side effects; do NOT also invoke `read`
+        // (that would consume an extra token).
+        if let Expr::Ident(name) = callee {
+            if name == "read" && args.iter().any(|a| matches!(a, Expr::DeclArg { .. })) {
+                let parts: Vec<String> = args.iter().map(|a| self.emit_expr(a)).collect();
+                return format!("({}{})", parts.join(", "), ", ZNOTHING");
+            }
+            // `readInto(x)` — read a token into an existing variable (§9.4)
+            if name == "readInto" && args.len() == 1 {
+                if let Expr::Ident(var) = &args[0] {
+                    return format!(
+                        "({{ z_env_set(env, \"{}\", z_read_token()); ZNOTHING; }})",
+                        cstr(var)
+                    );
+                }
+            }
+        }
         let (pos, named_c) = self.split_args(args);
         let pos_c = format!("(ZVal[]){{{}}}", pos.join(","));
         let npos = pos.len();

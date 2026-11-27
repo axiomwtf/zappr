@@ -1340,6 +1340,16 @@ impl Vm {
     // ---------- calls ----------
 
     fn eval_call(&mut self, callee: &Expr, args: &[Expr]) -> Result<Value, RuntimeError> {
+        // `readInto(x)` — read a token into an existing variable (§9.4)
+        if let Expr::Ident(n) = callee {
+            if n == "readInto" && args.len() == 1 {
+                if let Expr::Ident(var) = &args[0] {
+                    let v = self.builtin_read(vec![])?;
+                    self.set(var, v)?;
+                    return Ok(Value::Nothing);
+                }
+            }
+        }
         // `read(int age)` — declare-and-read (§9.4): reads whitespace tokens
         // and declares each named var in the current scope.
         if let Expr::Ident(n) = callee {

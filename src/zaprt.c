@@ -1596,11 +1596,40 @@ static ZVal z_clock(void) {
 }
 
 /* ---------- stdin / time helpers ---------- */
+/* shared whitespace-token stream: read()/readInto()/readDialogue() all
+   consume from it so `read(int a, str b)` shares one line like the
+   interpreter does. */
+static char z_inbuf[8192];
+static size_t z_inpos = 0;
+static int z_ineof = 0;
+static const char *z_next_token(void) {
+  static char tok[4096];
+  for (;;) {
+    while (z_inbuf[z_inpos] == ' ' || z_inbuf[z_inpos] == '\t' ||
+           z_inbuf[z_inpos] == '\r' || z_inbuf[z_inpos] == '\n')
+      z_inpos++;
+    if (z_inbuf[z_inpos]) {
+      size_t n = 0;
+      while (z_inbuf[z_inpos] && z_inbuf[z_inpos] != ' ' &&
+             z_inbuf[z_inpos] != '\t' && z_inbuf[z_inpos] != '\r' &&
+             z_inbuf[z_inpos] != '\n' && n < sizeof(tok) - 1)
+        tok[n++] = z_inbuf[z_inpos++];
+      tok[n] = 0;
+      return tok;
+    }
+    if (z_ineof) return NULL;
+    if (!fgets(z_inbuf, sizeof z_inbuf, stdin)) {
+      z_ineof = 1;
+      z_inpos = 0;
+      z_inbuf[0] = 0;
+      continue;
+    }
+    z_inpos = 0;
+  }
+}
 static ZVal z_read_token(void) {
-  char buf[4096];
-  if (!fgets(buf, sizeof buf, stdin)) return ZNOTHING;
-  char *tok = strtok(buf, " \t\r\n");
-  if (!tok) return z_str("");
+  const char *tok = z_next_token();
+  if (!tok) return ZNOTHING;
   /* int → float → str, mirroring interp */
   char *end;
   long long i = strtoll(tok, &end, 10);
@@ -1608,6 +1637,22 @@ static ZVal z_read_token(void) {
   double d = strtod(tok, &end);
   if (*end == 0 && end != tok) return z_float(d);
   return z_str(tok);
+}
+/* read(Ty name) — typed token parse; bad input fails loudly (§9.4). */
+static ZVal z_read_parse(const char *ty) {
+  const char *tok = z_next_token();
+  if (!tok) return z_errv("unexpected end of input", "read");
+  if (!strcmp(ty, "bool")) return z_bool(!strcmp(tok, "true") || !strcmp(tok, "1") || !strcmp(tok, "yes"));
+  if (!strcmp(ty, "str")) return z_str(tok);
+  if (!strcmp(ty, "float") || !strcmp(ty, "f32") || !strcmp(ty, "f64")) {
+    char *end; double d = strtod(tok, &end);
+    if (*end || end == tok) return z_errv("bad float input", tok);
+    return z_float(d);
+  }
+  /* int family */
+  char *end; long long i = strtoll(tok, &end, 10);
+  if (*end || end == tok) return z_errv("bad int input", tok);
+  return z_int(i);
 }
 static char *now_iso(void) {
   time_t t = time(NULL);
@@ -1725,18 +1770,36 @@ static ZVal z_builtin_named(const char *name, ZVal *pos, int npos, ZVal named, Z
       char *p = z_val_str(pos[0]);
       printf(">: %s", p); fflush(stdout);
     }
-    ZVal t = z_read_token();
-    if (t.tag == Z_NOTHING && !strcmp(name, "readDialogue")) {
-      /* read whole line instead */
-      char buf[4096];
-      if (fgets(buf, sizeof buf, stdin)) {
-        size_t l = strlen(buf);
-        while (l && (buf[l-1] == '\n' || buf[l-1] == '\r')) buf[--l] = 0;
-        return z_str(buf);
+    if (!strcmp(name, "readDialogue")) {
+      /* full line: finish the partially-buffered line, then read on */
+      static char line[8192];
+      size_t n = 0;
+      int done = 0;
+      while (z_inpos < sizeof(z_inbuf) && z_inbuf[z_inpos] && n < sizeof(line) - 1) {
+        char c = z_inbuf[z_inpos++];
+        if (c == '\n') { done = 1; break; }
+        line[n++] = c;
       }
-      return z_str("");
+      line[n] = 0;
+      /* empty remainder means we sat at a line boundary — read a fresh
+         line; otherwise the rest of the buffered line is the dialogue */
+      if (n == 0 || !done) {
+        if (!fgets(line + n, sizeof(line) - n, stdin)) {
+          if (n == 0) line[0] = 0;
+        }
+      }
+      size_t l = strlen(line);
+      while (l && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = 0;
+      /* keep any buffered tokens past the newline for the next read */
+      if (z_inbuf[z_inpos]) {
+        memmove(z_inbuf, z_inbuf + z_inpos, sizeof(z_inbuf) - z_inpos);
+      } else {
+        z_inbuf[0] = 0;
+      }
+      z_inpos = 0;
+      return z_str(line);
     }
-    return t;
+    return z_read_token();
   }
   if (!strcmp(name, "assert")) {
     int ok = npos && z_truthy(pos[0]);

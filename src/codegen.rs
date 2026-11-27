@@ -35,16 +35,19 @@ pub fn build(p: &Project, _vm: &mut Vm, target: &str) -> Result<(), String> {
     std::fs::write(&cfile, &csrc).map_err(|e| format!("cannot write {}: {e}", cfile.display()))?;
 
     let exe = std::env::temp_dir().join(format!("zap-{}", std::process::id()));
-    let status = Command::new("cc")
+    let ccout = Command::new("cc")
         .args(["-O2", "-std=c11", "-pthread", "-w", "-o"])
         .arg(&exe)
         .arg(&cfile)
-        .status()
+        .output()
         .map_err(|e| format!("cannot run cc: {e} (install a C11 compiler)"))?;
     let _ = std::fs::remove_file(&cfile);
-    if !status.success() {
+    if !ccout.status.success() {
         let _ = std::fs::remove_file(&exe);
-        return Err(format!("cc failed compiling {}", cfile.display()));
+        return Err(format!(
+            "cc failed compiling generated C:\n{}",
+            String::from_utf8_lossy(&ccout.stderr)
+        ));
     }
 
     // sign the artifact (§18.2) — trailer keeps the ELF directly runnable
