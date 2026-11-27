@@ -39,6 +39,8 @@ pub struct CGen<'a> {
     fn_params: HashMap<String, Vec<String>>,
     /// pre-scanned lambda count (ids assigned in emit order)
     lambda_count: usize,
+    /// emit-order lambda id counter
+    lambda_seq: usize,
     tmp_n: usize,
     loop_n: usize,
     /// loop break/continue label stack
@@ -68,6 +70,7 @@ pub fn emit(project: &Project, reachable: &HashSet<String>) -> Result<String, St
         bare_fns: HashMap::new(),
         fn_params: HashMap::new(),
         lambda_count: 0,
+        lambda_seq: 0,
         tmp_n: 0,
         loop_n: 0,
         loop_labels: Vec::new(),
@@ -996,8 +999,8 @@ impl<'a> CGen<'a> {
 
     fn emit_callback_stmt(&mut self, s: &mut String, call: &Expr, body: &[Stmt], ind: usize) {
         if let Expr::Call { callee, args } = call {
-            let lid = self.lambda_count;
-            self.lambda_count += 1;
+            let lid = self.lambda_seq;
+            self.lambda_seq += 1;
             self.emit_lambda_def(lid, body);
             let ex = self.emit_call_with_lambda(callee, args, lid);
             self.ind(s, ind);

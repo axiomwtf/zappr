@@ -19,6 +19,9 @@ pub fn build(p: &Project, _vm: &mut Vm, target: &str) -> Result<(), String> {
     if target == "web" || target == "wasm" || target == "wasm32" {
         return Err("web target: wasm backend lands with the DOM bridge (§18.1)".into());
     }
+    if target == "windows" || target == "windows-x86_64" {
+        return Err("windows target needs a mingw cross toolchain — not wired yet".into());
+    }
 
     // call-flattening: only fns reachable from main.main are emitted (§12)
     let graph = CallGraph::build(p.modules.iter().map(|(m, _, prog)| (m.as_str(), prog)));

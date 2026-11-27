@@ -1250,12 +1250,21 @@ static ZVal z_method(ZVal obj, const char *path, ZVal *args, int n, ZEnv *env) {
        whole path minus handled prefixes as single method name */
   }
   strncpy(seg, path, sizeof seg - 1); seg[sizeof seg - 1] = 0;
-  /* fnType on fn values (§8.1) */
-  if (obj.tag == Z_FUNC && !strcmp(seg, "fnType") && n) {
-    ZFuncV *f = z_alloc(sizeof(ZFuncV));
-    *f = *obj.u.fn;
-    f->want = args[0];
-    ZVal v = {0}; v.tag = Z_FUNC; v.u.fn = f; return v;
+  /* fnType boundary check on ANY value (§8.1) */
+  if (!strcmp(seg, "fnType")) {
+    if (!n) return z_errv("fnType expects a type argument", "fnType");
+    ZVal want = z_unwrap(args[0]);
+    if (obj.tag == Z_FUNC) {
+      /* wrap: record expected type on the fn value */
+      ZFuncV *f = z_alloc(sizeof(ZFuncV));
+      *f = *obj.u.fn;
+      f->want = args[0];
+      ZVal v = {0}; v.tag = Z_FUNC; v.u.fn = f; return v;
+    }
+    if (want.tag == Z_TYPE && z_satisfies(obj, want)) return obj;
+    if (want.tag == Z_TYPE)
+      return z_poisonv("wrongReturnType", "fnType", want.u.tname, z_tag_name(obj.tag));
+    return obj;
   }
   if (obj.tag == Z_TYPE) {
     /* method on type → treat as constructor-ish call */
@@ -1671,7 +1680,11 @@ static ZVal z_builtin_named(const char *name, ZVal *pos, int npos, ZVal named, Z
     }
     return v;
   }
-  if (!strcmp(name, "ui.run")) return ZNOTHING;
+  if (!strcmp(name, "ui.run")) {
+    if (npos && z_unwrap(pos[0]).tag == Z_UI && z_unwrap(pos[0]).u.ui)
+      z_ui_render(z_unwrap(pos[0]).u.ui, 0);
+    return ZNOTHING;
+  }
   if (!strcmp(name, "nav.go")) return z_errv("navigation unavailable", "nav.go");
   if (!strcmp(name, "math.abs")) {
     if (!npos) return ZNOTHING;

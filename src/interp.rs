@@ -410,11 +410,16 @@ impl Vm {
             } => {
                 self.cur_line = *line;
                 let c = self.eval(cond)?;
-                c.ensure_not_poison("if condition")
-                    .map_err(|m| RuntimeError {
-                        msg: m,
-                        line: *line,
-                    })?;
+                // Err/poison condition values take the else branch (§8.2) —
+                // `if x.fnType(T) as v {} else as e {}` is the boundary pattern
+                let is_errish = matches!(c, Value::Err(_) | Value::Poison { .. });
+                if !is_errish {
+                    c.ensure_not_poison("if condition")
+                        .map_err(|m| RuntimeError {
+                            msg: m,
+                            line: *line,
+                        })?;
+                }
                 if c.truthy() {
                     self.push_scope();
                     if let Some(b) = bind {
@@ -1788,7 +1793,7 @@ impl Vm {
         let _ = ns;
         match name {
             "read" | "readInto" | "readDialogue" | "assert" | "typeof" | "len" | "str"
-            | "int" | "float" | "weak" | "channel" | "exit" | "route" | "onClick" => {
+            | "int" | "float" | "weak" | "channel" | "exit" | "route" | "onClick" | "Err" => {
                 Ok(Some(self.builtin_dispatch(name, args.to_vec())?))
             }
             _ => Ok(None),
@@ -1993,6 +1998,13 @@ impl Vm {
                 Some(Value::Str(s)) => Value::Float(s.borrow().parse().unwrap_or(0.0)),
                 _ => Value::Float(0.0),
             }),
+            "Err" => {
+                let msg = args.first().map(|v| v.display()).unwrap_or_else(|| "error".into());
+                Ok(Value::Err(Rc::new(ErrVal {
+                    msg,
+                    origin: "Err".into(),
+                })))
+            }
             "weak" => Ok(match args.first() {
                 Some(v) => Value::Weak(Rc::new(RefCell::new(v.clone()))),
                 None => Value::Nothing,
