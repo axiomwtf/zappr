@@ -12,6 +12,8 @@
 #include <time.h>
 #include <ctype.h>
 #include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 
 typedef enum {
   Z_NOTHING, Z_INT, Z_FLOAT, Z_STR, Z_BOOL, Z_BYTES,
@@ -1576,16 +1578,62 @@ static void z_ui_render(ZUi *u, int depth) {
 }
 
 /* ---------- shell ---------- */
+/* call flattening (§20): a simple command with no shell metacharacters
+   execs directly — no /bin/sh, no command-string parsing wrapper.
+   Returns 1 and fills *out/*status when the simple path ran. */
+static int z_shell_simple(const char *c, char **out, int *status) {
+  static const char *meta = "|&;<>`$(){}*?[]'\"\\~#!^";
+  if (strpbrk(c, meta)) return 0;
+  char buf[4096];
+  snprintf(buf, sizeof buf, "%s", c);
+  char *argv[256]; int argc = 0;
+  char *save = NULL;
+  for (char *t = strtok_r(buf, " \t", &save); t && argc < 255;
+       t = strtok_r(NULL, " \t", &save))
+    argv[argc++] = t;
+  if (!argc) return 0;
+  argv[argc] = NULL;
+
+  int fd[2];
+  if (pipe(fd)) return 0;
+  pid_t pid = fork();
+  if (pid == 0) {
+    dup2(fd[1], STDOUT_FILENO);
+    close(fd[0]); close(fd[1]);
+    execvp(argv[0], argv);
+    _exit(127);
+  }
+  close(fd[1]);
+  if (pid < 0) { close(fd[0]); return 0; }
+  ZSb b = {0}; char tmp[4096]; size_t r;
+  while ((r = read(fd[0], tmp, sizeof tmp - 1)) > 0) { tmp[r] = 0; sb_add(&b, tmp); }
+  close(fd[0]);
+  int st; waitpid(pid, &st, 0);
+  *status = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+  *out = b.p ? b.p : z_strdup("");
+  return 1;
+}
 static ZVal z_shell(ZVal cmdv) {
   cmdv = z_unwrap(cmdv);
   const char *c = cmdv.tag == Z_STR ? cmdv.u.s : z_val_str(cmdv);
+  char *out = NULL; int status = 0;
+  if (z_shell_simple(c, &out, &status)) {
+    if (status != 0) return z_errv("shellOut failed", c);
+    size_t l = strlen(out);
+    while (l && isspace((unsigned char)out[l-1])) out[--l] = 0;
+    ZVal v = {0}; v.tag = Z_STR; v.u.s = out; return v;
+  }
   FILE *p = popen(c, "r");
   if (!p) return z_errv("shell failed", "shell");
   ZSb b = {0}; char tmp[4096];
   size_t r;
   while ((r = fread(tmp, 1, sizeof tmp - 1, p)) > 0) { tmp[r] = 0; sb_add(&b, tmp); }
-  pclose(p);
-  ZVal v = {0}; v.tag = Z_STR; v.u.s = b.p ? b.p : z_strdup(""); return v;
+  int rc = pclose(p);
+  if (rc != 0) return z_errv("shellOut failed", c);
+  char *s = b.p ? b.p : z_strdup("");
+  size_t l = strlen(s);
+  while (l && isspace((unsigned char)s[l-1])) s[--l] = 0;
+  ZVal v = {0}; v.tag = Z_STR; v.u.s = s; return v;
 }
 
 /* ---------- clock ---------- */

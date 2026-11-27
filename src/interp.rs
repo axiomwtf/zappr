@@ -2184,9 +2184,27 @@ fn fuse_name(parts: &[String]) -> String {
 }
 
 fn run_shell(cmd: &str) -> Result<String, String> {
-    let out = std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg(cmd)
+    // call flattening (§20): simple commands exec directly, no /bin/sh
+    const META: &[char] = &[
+        '|', '&', ';', '<', '>', '`', '$', '(', ')', '{', '}', '*', '?', '[', ']', '\'', '"',
+        '\\', '~', '#', '!', '^',
+    ];
+    let mut argv = cmd.split_whitespace();
+    let direct = !cmd.contains(META);
+    let prog = if direct { argv.next() } else { None };
+    let mut command = match prog {
+        Some(p) => {
+            let mut c = std::process::Command::new(p);
+            c.args(argv);
+            c
+        }
+        None => {
+            let mut c = std::process::Command::new("/bin/sh");
+            c.arg("-c").arg(cmd);
+            c
+        }
+    };
+    let out = command
         .output()
         .map_err(|e| format!("shellOut failed: {e}"))?;
     if out.status.success() {
