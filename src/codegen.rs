@@ -173,7 +173,7 @@ const imports = {{ env: {{
     const mod = await WebAssembly.compile(buf);
     const inst = await WebAssembly.instantiate(mod, imports);
     mem8 = new Uint8Array(inst.exports.memory.buffer);
-    inst.exports.main();
+    inst.exports.main(0, 0);
   }} catch (e) {{ log('wasm error: ' + e, true); }}
 }})();
 </script></body></html>"##,

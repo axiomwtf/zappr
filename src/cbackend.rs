@@ -19,7 +19,7 @@ use std::fmt::Write as _;
 const BUILTIN_ROOTS: &[&str] = &[
     "print", "read", "readInto", "readDialogue", "assert", "typeof", "len", "str", "int",
     "float", "env", "clock", "nav", "ui", "math", "json", "thisShell", "route", "onClick",
-    "weak", "channel", "spawn", "exit", "List", "Map", "Err", "parallel",
+    "weak", "channel", "spawn", "exit", "List", "Map", "Err", "parallel", "args",
 ];
 
 /// Primitive type names — evaluate to `Z_TYPE` values in expression position.
@@ -1431,7 +1431,7 @@ const RUNTIME_C: &str = include_str!("zaprt.c");
 const MAIN_C: &str = r#"
 // ===== entry =====
 int main(int argc, char **argv) {
-  (void)argc; (void)argv;
+  z_argv_set(argc, argv);
   z_global = z_env_new(NULL);
   z_env_define(z_global, "thisShell", z_shell_value());
   z_zap_init();

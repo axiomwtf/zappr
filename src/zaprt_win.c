@@ -854,8 +854,7 @@ static void z_win_argv(int *argc, char ***argv) {
   int n = 0;
   if (cmd) {
     while (*cmd == ' ' || *cmd == '\t') cmd++;
-    if (*cmd == '"') { cmd++; while (*cmd && *cmd != '"') cmd++; if (*cmd) cmd++; }
-    else while (*cmd && *cmd != ' ' && *cmd != '\t') cmd++;
+    /* keep argv[0] — z_argv_set skips it like every platform */
     while (*cmd) {
       while (*cmd == ' ' || *cmd == '\t') cmd++;
       if (!*cmd) break;

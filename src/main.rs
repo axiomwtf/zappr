@@ -56,7 +56,7 @@ fn dispatch(cmd: &str, rest: &[String]) -> Result<(), String> {
 /// Custom zap commands (§19.2): `cli:` files in Zappr.yaml are parsed and
 /// their functions callable as `zap <fn>`. Only the app's own cli list
 /// registers — dep cli: entries never do (§19 note).
-fn cmd_custom(cmd: &str, _rest: &[String]) -> Result<(), String> {
+fn cmd_custom(cmd: &str, rest: &[String]) -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let yaml = cwd.join("Zappr.yaml");
     if !yaml.exists() {
@@ -93,6 +93,7 @@ fn cmd_custom(cmd: &str, _rest: &[String]) -> Result<(), String> {
         );
         vm.load_module(&modname, &prog)
             .map_err(|e| format!("cli module `{modname}`: {}", e.msg))?;
+        vm.cli_args = rest.to_vec();
         return match vm.call_named(cmd, Vec::new()) {
             Ok(_) => Ok(()),
             Err(e) => Err(format!("`{cmd}` failed: {}", e.msg)),
@@ -109,10 +110,17 @@ fn cmd_new(rest: &[String]) -> Result<(), String> {
     project::scaffold(name, Path::new(dir))
 }
 
-fn cmd_run(_rest: &[String]) -> Result<(), String> {
+fn cmd_run(rest: &[String]) -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let p = project::load(&cwd, false)?;
     let mut vm = project::vm_for(&p)?;
+    // argv for args.* (§9.5): everything after `--`, else all of rest
+    let args: Vec<String> = if let Some(i) = rest.iter().position(|a| a == "--") {
+        rest[i + 1..].to_vec()
+    } else {
+        rest.to_vec()
+    };
+    vm.cli_args = args;
     match vm.run_main() {
         Ok(_) => Ok(()),
         Err(e) => Err(format!("runtime error: {}", e.msg)),

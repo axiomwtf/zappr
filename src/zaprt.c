@@ -1742,6 +1742,76 @@ static ZVal z_shell_value(void) {
   return rec;
 }
 
+/* ---------- process argv / args.* (§9.5) ---------- */
+static char **z_cli_args;
+static int z_cli_nargs;
+
+void z_argv_set(int argc, char **argv) {
+  if (argc > 0 && argv) { z_cli_args = argv + 1; z_cli_nargs = argc - 1; }
+  else { z_cli_args = NULL; z_cli_nargs = 0; }
+}
+
+/* parse cli args per §9.5 grammar; returns positional list and fills
+   opts map (caller overlays defaults). One pass, no allocation tricks. */
+static void z_args_parse(ZVec *pos_out, ZZMap *opts) {
+  int literal = 0;
+  for (int i = 0; i < z_cli_nargs; i++) {
+    const char *t = z_cli_args[i];
+    if (literal) { z_vec_push(pos_out, z_str(t)); continue; }
+    if (!strcmp(t, "--")) { literal = 1; continue; }
+    if (t[0] != '-' || !t[1]) { z_vec_push(pos_out, z_str(t)); continue; }
+    /* option token */
+    const char *eq = strchr(t, '=');
+    if (t[1] == '-' && eq && eq > t + 2) {
+      /* --name=value */
+      char *nm = z_strndup(t + 2, eq - (t + 2));
+      z_map_setp(opts, z_str(nm), z_str(eq + 1));
+      continue;
+    }
+    const char *nm = t[1] == '-' ? t + 2 : t + 1;
+    if (!*nm) { z_vec_push(pos_out, z_str(t)); continue; }
+    /* value form: next token not starting with '-' (or exactly "-") */
+    if (i + 1 < z_cli_nargs) {
+      const char *nx = z_cli_args[i + 1];
+      if (nx[0] != '-' || !strcmp(nx, "-")) {
+        z_map_setp(opts, z_str(nm), z_str(nx));
+        i++;
+        continue;
+      }
+    }
+    z_map_setp(opts, z_str(nm), z_bool(1));
+  }
+}
+
+static ZVal z_args_list(void) {
+  ZVec *vs = z_vec_new();
+  for (int i = 0; i < z_cli_nargs; i++) z_vec_push(vs, z_str(z_cli_args[i]));
+  ZVal v = {0}; v.tag = Z_LIST; v.u.vec = vs;
+  return v;
+}
+static ZVal z_args_positional(void) {
+  ZVec *pos = z_vec_new();
+  ZZMap *opts = z_map_new_p();
+  z_args_parse(pos, opts);
+  ZVal v = {0}; v.tag = Z_LIST; v.u.vec = pos;
+  return v;
+}
+static ZVal z_args_opts(ZVal defaults) {
+  defaults = z_unwrap(defaults);
+  ZZMap *opts = z_map_new_p();
+  ZVec *pos = z_vec_new();
+  z_args_parse(pos, opts);
+  /* defaults overlay: copy defaults entries first, parsed opts win */
+  ZVal out = z_map_new();
+  if (defaults.tag == Z_MAP && defaults.u.map) {
+    for (size_t i = 0; i < defaults.u.map->n; i++)
+      z_map_setp(out.u.map, defaults.u.map->p[i].k, defaults.u.map->p[i].v);
+  }
+  for (size_t i = 0; i < opts->n; i++)
+    z_map_setp(out.u.map, opts->p[i].k, opts->p[i].v);
+  return out;
+}
+
 /* ---------- builtin dispatch ---------- */
 static ZVal z_builtin_named(const char *name, ZVal *pos, int npos, ZVal named, ZEnv *env) {
   (void)named;
@@ -1821,6 +1891,10 @@ static ZVal z_builtin_named(const char *name, ZVal *pos, int npos, ZVal named, Z
     return z_json_encode(npos ? pos[0] : ZNOTHING);
   }
   if (!strcmp(name, "thisShell.shellOut")) return npos ? z_shell(pos[0]) : z_errv("shellOut needs a command", "shell");
+  /* args.* (§9.5) */
+  if (!strcmp(name, "args.list")) return z_args_list();
+  if (!strcmp(name, "args.opts")) return z_args_opts(npos ? pos[0] : ZNOTHING);
+  if (!strcmp(name, "args.positional")) return z_args_positional();
   /* bare builtins */
   if (!strcmp(name, "read")) return z_read_token();
   if (!strcmp(name, "readInto") || !strcmp(name, "readDialogue")) {

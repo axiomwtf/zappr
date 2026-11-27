@@ -44,6 +44,8 @@ pub struct Vm {
     pub ui: crate::uiruntime::UiRuntime,
     /// line number tracking for errors
     cur_line: usize,
+    /// argv for the running program / custom cli command (§9.5)
+    pub cli_args: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -75,6 +77,7 @@ impl Vm {
             zap_yaml: Value::Map(Rc::new(RefCell::new(Vec::new()))),
             ui: crate::uiruntime::UiRuntime::new(),
             cur_line: 0,
+            cli_args: Vec::new(),
         }
     }
 
@@ -1810,6 +1813,91 @@ impl Vm {
         }
     }
 
+    /// §9.5 arg parsing — one pass over cli_args.
+    /// Returns (positionals, opts-as-ordered-pairs, raw).
+    fn parse_cli_args(&self) -> (Vec<String>, Vec<(String, Value)>) {
+        let mut pos = Vec::new();
+        let mut opts: Vec<(String, Value)> = Vec::new();
+        let mut literal = false;
+        let a = &self.cli_args;
+        let mut i = 0;
+        while i < a.len() {
+            let t = &a[i];
+            if literal {
+                pos.push(t.clone());
+                i += 1;
+                continue;
+            }
+            if t == "--" {
+                literal = true;
+                i += 1;
+                continue;
+            }
+            if !t.starts_with('-') || t == "-" {
+                pos.push(t.clone());
+                i += 1;
+                continue;
+            }
+            // --name=value
+            if let Some(rest) = t.strip_prefix("--") {
+                if let Some(eq) = rest.find('=') {
+                    opts.push((rest[..eq].to_string(), Value::str(rest[eq + 1..].to_string())));
+                    i += 1;
+                    continue;
+                }
+            }
+            let name = t.strip_prefix("--").or_else(|| t.strip_prefix('-')).unwrap_or(t);
+            if name.is_empty() {
+                pos.push(t.clone());
+                i += 1;
+                continue;
+            }
+            // value form: next token not starting with '-' (or exactly "-")
+            if i + 1 < a.len() {
+                let nx = &a[i + 1];
+                if !nx.starts_with('-') || nx == "-" {
+                    opts.push((name.to_string(), Value::str(nx.clone())));
+                    i += 2;
+                    continue;
+                }
+            }
+            opts.push((name.to_string(), Value::Bool(true)));
+            i += 1;
+        }
+        (pos, opts)
+    }
+
+    fn args_list(&self) -> Value {
+        Value::List(std::rc::Rc::new(std::cell::RefCell::new(
+            self.cli_args.iter().map(|s| Value::str(s.clone())).collect(),
+        )))
+    }
+
+    fn args_positional(&self) -> Value {
+        let (pos, _) = self.parse_cli_args();
+        Value::List(std::rc::Rc::new(std::cell::RefCell::new(
+            pos.into_iter().map(Value::str).collect(),
+        )))
+    }
+
+    fn args_opts(&self, defaults: Option<&Value>) -> Value {
+        let (_, opts) = self.parse_cli_args();
+        // start from defaults map entries, parsed opts overlay (last wins)
+        let mut entries: Vec<(Value, Value)> = Vec::new();
+        if let Some(Value::Map(m)) = defaults {
+            entries = m.borrow().clone();
+        }
+        for (k, v) in opts {
+            let kv = Value::str(k);
+            if let Some(e) = entries.iter_mut().find(|(ek, _)| values_equal(ek, &kv)) {
+                e.1 = v;
+            } else {
+                entries.push((kv, v));
+            }
+        }
+        Value::Map(std::rc::Rc::new(std::cell::RefCell::new(entries)))
+    }
+
     fn namespaced_builtin(
         &mut self,
         ns: &str,
@@ -1818,6 +1906,9 @@ impl Vm {
     ) -> Result<Option<Value>, RuntimeError> {
         let full = format!("{ns}.{name}");
         match full.as_str() {
+            "args.list" => return Ok(Some(self.args_list())),
+            "args.opts" => return Ok(Some(self.args_opts(args.first()))),
+            "args.positional" => return Ok(Some(self.args_positional())),
             "print.nl" => {
                 let line = args.iter().map(|v| v.display()).collect::<Vec<_>>().join(" ");
                 println!("{line}");
