@@ -1,0 +1,14 @@
+[package]
+name = "zap"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Zappr compiler and toolchain: one binary, compiler, build driver, runner, package manager and formatter."
+
+[[bin]]
+name = "zap"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
