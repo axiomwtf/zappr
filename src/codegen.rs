@@ -49,7 +49,16 @@ pub fn build(p: &Project, _vm: &mut Vm, target: &str) -> Result<(), String> {
 
     // sign the artifact (§18.2) — trailer keeps the ELF directly runnable
     let bytes = std::fs::read(&exe).map_err(|e| format!("cannot read {}: {e}", exe.display()))?;
-    let artifact = crate::linker::sign(&bytes)?;
+    let artifact = if p.config.sign {
+        if let Some(k) = &p.config.sign_key {
+            // signKey is project-relative (§18.2)
+            crate::linker::sign(&bytes, Some(&p.root.join(k)))?
+        } else {
+            crate::linker::sign(&bytes, None)?
+        }
+    } else {
+        bytes
+    };
     let _ = std::fs::remove_file(&exe);
     std::fs::write(&out, &artifact).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
     #[cfg(unix)]

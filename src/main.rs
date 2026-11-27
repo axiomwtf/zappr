@@ -3,6 +3,7 @@ mod cbackend;
 mod checker;
 mod codegen;
 mod config;
+mod deps;
 mod fmt;
 mod interp;
 mod lexer;
@@ -48,8 +49,56 @@ fn dispatch(cmd: &str, rest: &[String]) -> Result<(), String> {
         "fmt" => cmd_fmt(rest),
         "verify" => cmd_verify(rest),
         "copyright" => cmd_copyright(rest),
-        other => Err(format!("unknown command `{other}` — see `zap --help`")),
+        other => cmd_custom(other, rest),
     }
+}
+
+/// Custom zap commands (§19.2): `cli:` files in Zappr.yaml are parsed and
+/// their functions callable as `zap <fn>`. Only the app's own cli list
+/// registers — dep cli: entries never do (§19 note).
+fn cmd_custom(cmd: &str, _rest: &[String]) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let yaml = cwd.join("Zappr.yaml");
+    if !yaml.exists() {
+        return Err(format!("unknown command `{cmd}` — see `zap --help`"));
+    }
+    let p = project::load(&cwd, false)?;
+    if p.config.cli.is_empty() {
+        return Err(format!("unknown command `{cmd}` — see `zap --help`"));
+    }
+    let mut vm = project::vm_for(&p)?;
+    // parse each cli file; find a fn named `cmd`
+    for rel in &p.config.cli {
+        let path = p.root.join(rel);
+        let src = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cli file {}: {e}", path.display()))?;
+        let prog = parser::parse(&src).map_err(|e| {
+            format!("{}:{}:{}: parse error: {}", path.display(), e.line, e.col, e.msg)
+        })?;
+        let has = prog.items.iter().any(|it| {
+            matches!(it, parser::Item::Fn { name, .. } if name == cmd)
+        });
+        if !has {
+            continue;
+        }
+        let stem = Path::new(rel)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("cmd");
+        let modname = format!(
+            "cli{}",
+            stem.chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>()
+        );
+        vm.load_module(&modname, &prog)
+            .map_err(|e| format!("cli module `{modname}`: {}", e.msg))?;
+        return match vm.call_named(cmd, Vec::new()) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("`{cmd}` failed: {}", e.msg)),
+        };
+    }
+    Err(format!("unknown command `{cmd}` — see `zap --help`"))
 }
 
 fn cmd_new(rest: &[String]) -> Result<(), String> {

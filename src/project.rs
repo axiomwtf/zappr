@@ -1,6 +1,7 @@
 //! Project loading: Zappr.yaml + zap/**/*.znz → modules (SPEC §17, §12).
 
 use crate::config::{self, Config};
+use crate::deps;
 use crate::interp::Vm;
 use crate::parser::{self, Program};
 use crate::value::{TypeRepr, Value};
@@ -32,6 +33,15 @@ pub fn fuse_segments(segs: &[String]) -> String {
         }
     }
     out
+}
+
+/// Public wrapper for dep loading (deps.rs walks dep zap/ dirs).
+pub fn collect_znz_pub(
+    dir: &Path,
+    base: &Path,
+    out: &mut Vec<(String, PathBuf)>,
+) -> Result<(), String> {
+    collect_znz(dir, base, out)
 }
 
 /// Walk zap/ recursively, returning (module_name, path) pairs.
@@ -121,6 +131,32 @@ pub fn load(dir: &Path, include_tests: bool) -> Result<Project, String> {
         })?;
         modules.push((mname, path, prog));
     }
+
+    // githubDeps (§13): fetch/verify, then load dep modules into the
+    // same visibility domain. Newly resolved pins are written back.
+    if !config.github_deps.is_empty() {
+        let (fetched, pending) =
+            deps::fetch_all(&config.github_deps, &config.resolved)?;
+        if !pending.is_empty() {
+            let mut merged = config.resolved.clone();
+            for (k, v) in &pending {
+                merged.insert(k.clone(), v.clone());
+            }
+            deps::write_resolved(&root, &merged)?;
+        }
+        for dep in &fetched {
+            for (mname, path, prog) in deps::load_dep_modules(dep, include_tests)? {
+                if modules.iter().any(|(n, _, _)| n == &mname) {
+                    return Err(format!(
+                        "module name `{mname}` from dep `{}` collides with an existing module",
+                        dep.name
+                    ));
+                }
+                modules.push((mname, path, prog));
+            }
+        }
+    }
+
     Ok(Project {
         root,
         config,

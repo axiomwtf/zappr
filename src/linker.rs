@@ -72,10 +72,20 @@ fn check_magic_and_signature(data: &[u8]) -> Result<(), String> {
     }
 }
 
-/// Sign `payload`, returning payload+trailer. Key: `signKey` in
-/// Zappr.yaml (read via ZAP_SIGN_KEY env by caller), else ./signing.key.
-pub fn sign(payload: &[u8]) -> Result<Vec<u8>, String> {
-    let key = ensure_key()?;
+/// Sign `payload`, returning payload+trailer. `key` overrides the
+/// `signKey`/ZAP_SIGN_KEY/./signing.key resolution (project-relative paths
+/// are resolved by the caller).
+pub fn sign(payload: &[u8], key: Option<&Path>) -> Result<Vec<u8>, String> {
+    let key = match key {
+        Some(k) => {
+            let k = k.to_path_buf();
+            if !k.exists() {
+                return Err(format!("signKey not found: {}", k.display()));
+            }
+            k
+        }
+        None => ensure_key()?,
+    };
     let pk_raw = pubkey_raw(&key)?;
 
     let dir = std::env::temp_dir();
