@@ -5,6 +5,8 @@ mod codegen;
 mod config;
 mod deps;
 mod fmt;
+mod font8x8;
+mod gui;
 mod interp;
 mod lexer;
 mod linker;
@@ -131,14 +133,19 @@ fn cmd_build(rest: &[String]) -> Result<(), String> {
     // target selection: flag > Zappr.yaml targets > host
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let p = project::load(&cwd, false)?;
+    let release = rest.iter().any(|a| a == "--release" || a == "-r");
     let target = rest
         .iter()
-        .find(|a| a.starts_with("--target="))
-        .map(|a| a.trim_start_matches("--target=").to_string())
-        .or_else(|| rest.iter().find(|a| a.starts_with('-')).cloned())
+        .find_map(|a| a.strip_prefix("--target="))
+        .map(str::to_string)
+        .or_else(|| {
+            rest.iter()
+                .find(|a| a.starts_with('-') && !a.starts_with("--") && *a != "-r")
+                .cloned()
+        })
         .or_else(|| p.config.targets.first().cloned())
         .unwrap_or_else(|| "linux".into());
-    codegen::build(&p, &mut project::vm_for(&p)?, &target)
+    codegen::build(&p, &mut project::vm_for(&p)?, &target, release)
 }
 
 fn cmd_check(_rest: &[String]) -> Result<(), String> {

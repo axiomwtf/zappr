@@ -1967,16 +1967,30 @@ impl Vm {
             ))),
             "ui.window" => Ok(Some(self.ui.window(&args))),
             "ui.run" => {
-                // headless run: drive one dirty-check tick per window.
-                // The native renderer takes over at codegen time; the DOM
-                // bridge at wasm. Element semantics are shared (§16).
-                for w in &self.ui.windows {
-                    let mut el = w.borrow_mut();
-                    if el.dirty {
-                        el.dirty = false;
-                        self.ui.frame += 1;
+                // native renderer when a display exists (§16); headless tick otherwise
+                let mut ui = std::mem::take(&mut self.ui);
+                let mut rendered = false;
+                #[cfg(unix)]
+                {
+                    if let Ok(Some(mut app)) = crate::gui::open(&ui) {
+                        rendered = true;
+                        let _ = crate::gui::run(&mut app, &ui, &mut |f| {
+                            self.call_func_value(&f, vec![])
+                                .map(|_| ())
+                                .map_err(|e| e.msg)
+                        });
                     }
                 }
+                if !rendered {
+                    for w in &ui.windows {
+                        let mut el = w.borrow_mut();
+                        if el.dirty {
+                            el.dirty = false;
+                            ui.frame += 1;
+                        }
+                    }
+                }
+                self.ui = ui;
                 Ok(Some(Value::Nothing))
             }
             "nav.go" => {

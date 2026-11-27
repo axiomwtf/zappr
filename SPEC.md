@@ -582,6 +582,7 @@ my-app/
 zap new my-app            /// scaffold project + Zappr.yaml
 zap run                   /// build (in-memory where possible) + execute
 zap build                 /// linux / windows / web — via flags or targets in Zappr.yaml
+                           /// --release for dist/release, default dist/debug
 zap check                 /// type-check only, fast feedback
 zap test                  /// run zap/tests/test.znz and its pipeline
 zap fmt                   /// the janitor (§18.3)
@@ -591,8 +592,17 @@ zap copyright headers     /// stamp license headers, on explicit intent only
 
 ### 18.1 Build outputs
 
-- **linux / windows:** one static executable per platform. License headers ride inside the binary as a comment section.
-- **web:** exactly two files — `app.wasm` (the whole program, UI engine included) and `404.html` (a small, static, self-contained wasm loader, stamped verbatim from inside zap — same bytes for every project). No JS shims, no bundler, no hidden third file. `404.html` is named so GitHub Pages routes deep links into the app; the router reads the real URL and renders the right page locally. If a feature needs more JS than the loader contains, it is a spec violation and zap says so.
+Artifacts land in `dist/`, named after the project, split by profile:
+
+```
+dist/debug/<name>          /// zap build        (-O0 -g)
+dist/release/<name>        /// zap build --release  (-O2)
+dist/debug/<name>.exe      /// --target=windows
+dist/debug/<name>.wasm + <name>.html   /// --target=web
+```
+
+- **linux / windows:** one static executable per platform. License headers ride inside the binary as a comment section. The native renderer is statically linked Rust: Wayland (wl_shm + xdg-shell, real server-side decorations) on Linux; X11 is not used. Windows uses Win32 GDI.
+- **web:** exactly two files — `<name>.wasm` (the whole program, UI engine included) and `<name>.html` (a small, static, self-contained wasm loader, stamped verbatim from inside zap — same bytes for every project). No JS shims, no bundler, no hidden third file. The loader fetches the `.wasm` sitting next to it, strips the signature trailer, instantiates and wires the env imports. If a feature needs more JS than the loader contains, it is a spec violation and zap says so.
 
 ### 18.2 Signing
 

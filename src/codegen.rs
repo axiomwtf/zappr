@@ -21,21 +21,16 @@ fn zap_tmp_dir() -> PathBuf {
 }
 
 /// `zap build` entry point — content-hash artifact cache (§21).
-pub fn build(p: &Project, vm: &mut Vm, target: &str) -> Result<(), String> {
-    let key = build_cache_key(p, target);
+/// `release` selects dist/release (-O2) vs dist/debug (-O0 -g).
+pub fn build(p: &Project, vm: &mut Vm, target: &str, release: bool) -> Result<(), String> {
+    let key = build_cache_key(p, target, release);
     let cdir = artifact_cache_dir();
     let cfile = cdir.join(format!("{key:016x}"));
     let meta = cdir.join(format!("{key:016x}.json"));
 
-    // figure out expected outputs for this target
+    // figure out expected outputs for this target (§18.1)
     let is_web = matches!(target, "web" | "wasm" | "wasm32");
-    let out_name = match target {
-        "linux" | "linux-x86_64" => "zap-out",
-        "windows" | "windows-x86_64" => "zap-out.exe",
-        _ => "zap-out.wasm",
-    };
-    let out = PathBuf::from(out_name);
-    let html = out.with_extension("html");
+    let (out, html) = artifact_paths(p, target, release);
 
     // cache hit: artifact + optional html sidecar present and fresh
     if cfile.exists() && std::fs::metadata(&cfile).map(|m| m.len() > 0).unwrap_or(false)
@@ -57,7 +52,7 @@ pub fn build(p: &Project, vm: &mut Vm, target: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    build_inner(p, vm, target)?;
+    build_inner(p, vm, target, release, &out)?;
 
     // populate cache
     if let Ok(bytes) = std::fs::read(&out) {
@@ -72,6 +67,23 @@ pub fn build(p: &Project, vm: &mut Vm, target: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// dist/{debug|release}/<name>[.exe|.wasm] under the project root (§18.1)
+fn artifact_paths(p: &Project, target: &str, release: bool) -> (PathBuf, PathBuf) {
+    let name = p.config.name.clone().unwrap_or_else(|| "app".into());
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let dir = p.root.join("dist").join(if release { "release" } else { "debug" });
+    let _ = std::fs::create_dir_all(&dir);
+    let stem = dir.join(&safe);
+    match target {
+        "linux" | "linux-x86_64" => (stem.clone(), stem.with_extension("html")),
+        "windows" | "windows-x86_64" => (stem.with_extension("exe"), stem.with_extension("html")),
+        _ => (stem.with_extension("wasm"), stem.with_extension("html")),
+    }
+}
+
 fn artifact_cache_dir() -> PathBuf {
     let base = std::env::var("XDG_CACHE_HOME").map(PathBuf::from).ok()
         .or_else(|| std::env::var("HOME").map(|h| PathBuf::from(h).join(".cache")).ok());
@@ -82,10 +94,11 @@ fn artifact_cache_dir() -> PathBuf {
 
 /// Content key over everything that can change the artifact: all module
 /// sources, Zappr.yaml, cli files, sign key, target, tool version (§21).
-fn build_cache_key(p: &Project, target: &str) -> u64 {
+fn build_cache_key(p: &Project, target: &str, release: bool) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     target.hash(&mut h);
+    release.hash(&mut h);
     p.config.sign.hash(&mut h);
     env!("CARGO_PKG_VERSION").hash(&mut h);
     for (m, path, _) in &p.modules {
@@ -100,16 +113,73 @@ fn build_cache_key(p: &Project, target: &str) -> u64 {
     if let Some(k) = &p.config.sign_key {
         if let Ok(b) = std::fs::read(p.root.join(k)) { b.hash(&mut h); }
     }
+    // backend/runtime sources shape the artifact too (§21)
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for f in ["src/zaprt.c", "src/lib.rs", "src/wayland.rs", "src/font8x8.inc",
+              "src/cbackend.rs", "src/codegen.rs", "src/callcollector.rs"] {
+        if let Ok(b) = std::fs::read(manifest.join(f)) { b.hash(&mut h); }
+    }
     h.finish()
 }
 
-fn build_inner(p: &Project, _vm: &mut Vm, target: &str) -> Result<(), String> {
-    let out = match target {
-        "linux" | "linux-x86_64" => PathBuf::from("zap-out"),
-        "windows" | "windows-x86_64" => PathBuf::from("zap-out.exe"),
-        "web" | "wasm" | "wasm32" => PathBuf::from("zap-out.wasm"),
-        other => return Err(format!("unknown target `{other}` — targets: linux, windows, web")),
+/// Build (or reuse) the statically-linked native GUI host (§16).
+/// `libzapgui` is a Rust staticlib compiled by cargo for the requested
+/// target; the result is cached by content hash of its sources.
+/// Returns the path to `libzapgui.a` (linux) or `libzapgui.a` (windows-gnu).
+fn gui_lib(target: &str) -> Result<PathBuf, String> {
+    use std::hash::{Hash, Hasher};
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for f in ["src/lib.rs", "src/wayland.rs", "src/win32.rs", "src/font8x8.inc", "Cargo.toml"] {
+        let b = std::fs::read(manifest.join(f))
+            .map_err(|e| format!("cannot read {f} for libzapgui: {e}"))?;
+        b.hash(&mut h);
+    }
+    let key = h.finish();
+    let triple = match target {
+        "linux" | "linux-x86_64" => "x86_64-unknown-linux-gnu",
+        "windows" | "windows-x86_64" => "x86_64-pc-windows-gnu",
+        _ => return Err(format!("no gui lib for target {target}")),
     };
+    let dir = artifact_cache_dir();
+    let out = dir.join(format!("libzapgui-{target}-{key:016x}.a"));
+    if out.exists() { return Ok(out); }
+
+    // rustup's cargo proxy does not set RUSTC; cargo would find the
+    // system rustc which may lack the windows target's std. Prefer the
+    // rustup-managed toolchain's cargo+rustc pair when present.
+    let home = std::env::var("HOME").unwrap_or_default();
+    let rustup_cargo = PathBuf::from(&home)
+        .join(".rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin");
+    let (cargo, rustc) = if rustup_cargo.join("cargo").exists() {
+        (rustup_cargo.join("cargo"), rustup_cargo.join("rustc"))
+    } else {
+        (PathBuf::from("cargo"), PathBuf::from("rustc"))
+    };
+    let tdir = dir.join("zapgui-target");
+    let o = Command::new(&cargo)
+        .args(["build", "--release", "--lib", "--target", triple,
+               "--target-dir"])
+        .arg(&tdir)
+        .current_dir(&manifest)
+        .env("RUSTC", &rustc)
+        .env("RUSTFLAGS", "-C panic=abort -C debuginfo=1")
+        .env("CARGO_TERM_COLOR", "never")
+        .output()
+        .map_err(|e| format!("cannot run cargo for libzapgui: {e}"))?;
+    if !o.status.success() {
+        return Err(format!(
+            "libzapgui build failed:\n{}",
+            String::from_utf8_lossy(&o.stderr)
+        ));
+    }
+    let built = tdir.join(triple).join("release").join("libzapgui.a");
+    std::fs::copy(&built, &out).map_err(|e| format!("cannot stage libzapgui: {e}"))?;
+    Ok(out)
+}
+
+fn build_inner(p: &Project, _vm: &mut Vm, target: &str, release: bool, out: &Path) -> Result<(), String> {
+    let opt: &[&str] = if release { &["-O2"] } else { &["-O0", "-g"] };
     let is_web = matches!(target, "web" | "wasm" | "wasm32");
     let is_win = matches!(target, "windows" | "windows-x86_64");
 
@@ -121,10 +191,10 @@ fn build_inner(p: &Project, _vm: &mut Vm, target: &str) -> Result<(), String> {
     }
 
     if is_web {
-        return build_web(p, &reachable, &out);
+        return build_web(p, &reachable, out, release);
     }
     if is_win {
-        return build_win(p, &reachable, &out);
+        return build_win(p, &reachable, out, release);
     }
 
     let csrc = cbackend::emit(p, &reachable)?;
@@ -132,10 +202,17 @@ fn build_inner(p: &Project, _vm: &mut Vm, target: &str) -> Result<(), String> {
     std::fs::write(&cfile, &csrc).map_err(|e| format!("cannot write {}: {e}", cfile.display()))?;
 
     let exe = zap_tmp_dir().join(format!("zap-{}", std::process::id()));
+    let gui = gui_lib("linux")?;
+    let mut cargs: Vec<&str> = vec!["-std=c11", "-pthread", "-w"];
+    cargs.extend_from_slice(opt);
+    cargs.push("-o");
     let ccout = Command::new("cc")
-        .args(["-O2", "-std=c11", "-pthread", "-w", "-o"])
+        .args(&cargs)
         .arg(&exe)
         .arg(&cfile)
+        .arg(&gui)
+        .arg("-ldl")
+        .env("TMPDIR", zap_tmp_dir())
         .output()
         .map_err(|e| format!("cannot run cc: {e} (install a C11 compiler)"))?;
     let _ = std::fs::remove_file(&cfile);
@@ -173,7 +250,8 @@ fn build_inner(p: &Project, _vm: &mut Vm, target: &str) -> Result<(), String> {
 /// WebAssembly target (§18.1): the same C output compiled freestanding to
 /// wasm32 with our shim libc, linked by wasm-ld via clang's lld driver.
 /// Emits `zap-out.wasm` plus `zap-out.html` (browser loader).
-fn build_web(p: &Project, reachable: &HashSet<String>, out: &PathBuf) -> Result<(), String> {
+fn build_web(p: &Project, reachable: &HashSet<String>, out: &Path, release: bool) -> Result<(), String> {
+    let opt: &[&str] = if release { &["-O2"] } else { &["-O0", "-g"] };
     let csrc = cbackend::emit(p, reachable)?;
     let pid = std::process::id();
     let cfile = zap_tmp_dir().join(format!("zap-{}-{}.c", p.config.name.clone().unwrap_or_else(|| "app".into()), pid));
@@ -181,13 +259,16 @@ fn build_web(p: &Project, reachable: &HashSet<String>, out: &PathBuf) -> Result<
     let wshim = concat!(env!("CARGO_MANIFEST_DIR"), "/src/zaprt_wasm.c");
     std::fs::write(&cfile, &csrc).map_err(|e| format!("cannot write {}: {e}", cfile.display()))?;
 
-    let wasm = out.with_extension("wasm");
+    let wasm = out;
     // TMPDIR: clang's wasm driver writes temp objects; keep them in /tmp
     // (or ZAP_TMP) and clean up after.
     let cout = Command::new("clang")
         .args([
-            "--target=wasm32-unknown-unknown", "-O2", "-ffreestanding", "-nostdlib",
+            "--target=wasm32-unknown-unknown", "-ffreestanding", "-nostdlib",
             "-fno-builtin", "-std=c11", "-w", "-I", shim,
+        ])
+        .args(opt)
+        .args([
             "-Wl,--no-entry", "-Wl,--export=main", "-Wl,--export-memory", "-o",
         ])
         .arg(&wasm)
@@ -226,6 +307,7 @@ fn build_web(p: &Project, reachable: &HashSet<String>, out: &PathBuf) -> Result<
 <html><head><meta charset="utf-8"><title>{title}</title>
 <style>body{{background:#111;color:#ddd;font:14px/1.5 monospace;padding:1em;white-space:pre-wrap}}</style>
 </head><body><div id="out"></div><script>
+const WASM_NAME = '{wasm_name}';
 const out = document.getElementById('out');
 const log = (s, err) => {{ const d = document.createElement('div');
   if (err) d.style.color = '#f66'; d.textContent = s; out.appendChild(d); }};
@@ -244,7 +326,7 @@ const imports = {{ env: {{
 }} }};
 (async () => {{
   try {{
-    let buf = await (await fetch('zap-out.wasm')).arrayBuffer();
+    let buf = await (await fetch(WASM_NAME)).arrayBuffer();
     /* strip ZAPR signature trailer if present (4 magic + 32 hash + 64 sig) */
     const b = new Uint8Array(buf);
     const TRAILER = 100;
@@ -259,7 +341,8 @@ const imports = {{ env: {{
   }} catch (e) {{ log('wasm error: ' + e, true); }}
 }})();
 </script></body></html>"##,
-        title = p.config.name.clone().unwrap_or_else(|| "zap app".into())
+        title = p.config.name.clone().unwrap_or_else(|| "zap app".into()),
+        wasm_name = wasm.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| "app.wasm".into())
     );
     let html_path = out.with_extension("html");
     std::fs::write(&html_path, html).map_err(|e| format!("cannot write {}: {e}", html_path.display()))?;
@@ -272,8 +355,12 @@ const imports = {{ env: {{
 /// Windows PE target: same generated C compiled freestanding for
 /// x86_64-windows-gnu, linked by ld.lld into a native .exe. kernel32
 /// imports come from an import lib we generate with llvm-dlltool.
-fn build_win(p: &Project, reachable: &HashSet<String>, out: &PathBuf) -> Result<(), String> {
-    const KERNEL32_DEF: &str = "LIBRARY kernel32.dll\nEXPORTS\n    GetStdHandle\n    WriteFile\n    ReadFile\n    GetEnvironmentVariableA\n    GetSystemTimeAsFileTime\n    ExitProcess\n    GetCommandLineA\n    GetProcessHeap\n    HeapAlloc\n    HeapFree\n";
+fn build_win(p: &Project, reachable: &HashSet<String>, out: &Path, release: bool) -> Result<(), String> {
+    let opt: &[&str] = if release { &["-O2"] } else { &["-O0", "-g"] };
+    const KERNEL32_DEF: &str = "LIBRARY kernel32.dll\nEXPORTS\n    GetStdHandle\n    WriteFile\n    ReadFile\n    GetEnvironmentVariableA\n    GetSystemTimeAsFileTime\n    ExitProcess\n    GetCommandLineA\n    GetProcessHeap\n    HeapAlloc\n    HeapFree\n    GetModuleHandleW\n";
+    const USER32_DEF: &str = "LIBRARY user32.dll\nEXPORTS\n    RegisterClassW\n    CreateWindowExW\n    DefWindowProcW\n    GetMessageW\n    TranslateMessage\n    DispatchMessageW\n    PostQuitMessage\n    ShowWindow\n    UpdateWindow\n    GetDC\n    ReleaseDC\n    SetWindowLongPtrW\n    BeginPaint\n    EndPaint\n    LoadCursorW\n";
+    const GDI32_DEF: &str = "LIBRARY gdi32.dll\nEXPORTS\n    CreateDIBSection\n    CreateCompatibleDC\n    SelectObject\n    DeleteObject\n    DeleteDC\n    BitBlt\n    CreateFontW\n    SetBkMode\n    SetTextColor\n    ExtTextOutW\n    GetTextExtentPoint32W\n";
+    const MCRT_DEF: &str = "LIBRARY msvcrt.dll\nEXPORTS\n    malloc\n    free\n";
     let csrc = cbackend::emit(p, reachable)?;
     let pid = std::process::id();
     let name = p.config.name.clone().unwrap_or_else(|| "app".into());
@@ -305,32 +392,43 @@ fn build_win(p: &Project, reachable: &HashSet<String>, out: &PathBuf) -> Result<
     let _ = std::fs::remove_file(&cfile);
 
     // kernel32 import library via llvm-dlltool
-    let def = zap_tmp_dir().join(format!("zap-{name}-{pid}.def"));
-    let lib = zap_tmp_dir().join(format!("zap-{name}-{pid}-kernel32.a"));
-    std::fs::write(&def, KERNEL32_DEF).map_err(|e| e.to_string())?;
-    let o = Command::new("llvm-dlltool")
-        .args(["-m", "i386:x86-64", "-d"])
-        .arg(&def)
-        .args(["-l"])
-        .arg(&lib)
-        .args(["-D", "kernel32.dll"])
-        .output()
-        .map_err(|e| format!("llvm-dlltool failed to launch: {e}"))?;
-    if !o.status.success() {
-        return Err(format!("llvm-dlltool failed:\n{}", String::from_utf8_lossy(&o.stderr)));
-    }
+    let mkimp = |defname: &str, dll: &str, tag: &str| -> Result<PathBuf, String> {
+        let def = zap_tmp_dir().join(format!("zap-{name}-{pid}-{tag}.def"));
+        let lib = zap_tmp_dir().join(format!("zap-{name}-{pid}-{tag}.a"));
+        std::fs::write(&def, defname).map_err(|e| e.to_string())?;
+        let o = Command::new("llvm-dlltool")
+            .args(["-m", "i386:x86-64", "-d"])
+            .arg(&def)
+            .args(["-l"])
+            .arg(&lib)
+            .args(["-D", dll])
+            .output()
+            .map_err(|e| format!("llvm-dlltool failed to launch: {e}"))?;
+        if !o.status.success() {
+            return Err(format!("llvm-dlltool failed:\n{}", String::from_utf8_lossy(&o.stderr)));
+        }
+        let _ = std::fs::remove_file(&def);
+        Ok(lib)
+    };
+    let lib = mkimp(KERNEL32_DEF, "kernel32.dll", "k32")?;
+    let mlib = mkimp(MCRT_DEF, "msvcrt.dll", "crt")?;
+    let ulib = mkimp(USER32_DEF, "user32.dll", "u32")?;
+    let glib = mkimp(GDI32_DEF, "gdi32.dll", "g32")?;
 
+    let gui = gui_lib("windows")?;
     let lout = Command::new("ld.lld")
         .args(["-m", "i386pep", "-e", "mainCRTStartup", "--subsystem=console",
-               "--no-insert-timestamp"])
-        .arg(&app_o).arg(&rt_o).arg(&lib)
+               "--no-insert-timestamp", "--error-limit=0"])
+        .arg(&app_o).arg(&rt_o).arg(&lib).arg(&mlib).arg(&ulib).arg(&glib).arg(&gui)
         .arg("-o").arg(out)
         .output()
         .map_err(|e| format!("ld.lld failed to launch: {e}"))?;
     let _ = std::fs::remove_file(&app_o);
     let _ = std::fs::remove_file(&rt_o);
-    let _ = std::fs::remove_file(&def);
     let _ = std::fs::remove_file(&lib);
+    let _ = std::fs::remove_file(&mlib);
+    let _ = std::fs::remove_file(&ulib);
+    let _ = std::fs::remove_file(&glib);
     if !lout.status.success() {
         return Err(format!("PE link failed:\n{}", String::from_utf8_lossy(&lout.stderr)));
     }

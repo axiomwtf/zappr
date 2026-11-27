@@ -120,6 +120,7 @@ static ZVal z_call_qname(const char *name, ZVal *pos, int npos, ZEnv *env);
 static ZVal z_invoke(ZVal f, ZVal *pos, int npos, ZVal named, ZEnv *env);
 static ZVal z_method(ZVal obj, const char *path, ZVal *args, int n, ZEnv *env);
 static void z_ui_render(ZUi *u, int depth);
+static void z_ui_host_run(ZUi *u);
 
 static ZEnv *z_global;
 /* shortest round-trip float formatting (matches interp's Display) */
@@ -520,6 +521,7 @@ static ZVal z_call_qname(const char *name, ZVal *pos, int npos, ZEnv *env);
 static ZVal z_invoke(ZVal f, ZVal *pos, int npos, ZVal named, ZEnv *env);
 static ZVal z_method(ZVal obj, const char *path, ZVal *args, int n, ZEnv *env);
 static void z_ui_render(ZUi *u, int depth);
+static void z_ui_host_run(ZUi *u);
 
 /* unwrap weak refs one level */
 static ZVal z_unwrap(ZVal v) {
@@ -1133,6 +1135,7 @@ static ZVal z_call_type_named(ZVal t, ZVal *pos, int npos, ZVal named) {
 /* ---------- methods ---------- */
 static ZVal z_method(ZVal obj, const char *path, ZVal *args, int n, ZEnv *env);
 static void z_ui_render(ZUi *u, int depth);
+static void z_ui_host_run(ZUi *u);
 
 static ZVal z_list_method(ZVal obj, const char *m, ZVal *args, int n, ZEnv *env) {
   ZVec *v = obj.u.vec;
@@ -1339,7 +1342,7 @@ static ZVal z_ui_method(ZVal obj, const char *path, ZVal *args, int n, ZEnv *env
   }
   /* run / show etc on window */
   if (!strcmp(path, "run") || !strcmp(path, "show")) {
-    z_ui_render(u, 0);
+    z_ui_host_run(u);
     return ZNOTHING;
   }
   {
@@ -1585,6 +1588,18 @@ static void z_ui_render(ZUi *u, int depth) {
   }
   printf("[%s%s%s]\n", kind, txt ? " " : "", txt ? txt : "");
   for (size_t i = 0; i < u->cn; i++) z_ui_render(u->ch[i], depth + 1);
+}
+
+/* native gui host (§16): zap_gui_run comes from the statically linked
+   libzapgui (Rust staticlib); absent on wasm it falls back to the
+   headless element dump. */
+static void zgui_invoke(const ZVal *fv) { (void)z_call_val(*fv, NULL, 0); }
+static void z_ui_host_run(ZUi *u) {
+#if defined(__linux__) || defined(_WIN32)
+  extern int zap_gui_run(void *root, void (*invoke)(const ZVal *));
+  if (zap_gui_run(u, zgui_invoke)) return;
+#endif
+  z_ui_render(u, 0);
 }
 
 /* ---------- shell ---------- */
@@ -1857,11 +1872,13 @@ static ZVal z_builtin_named(const char *name, ZVal *pos, int npos, ZVal named, Z
       char *t = z_val_str(pos[0]);
       z_ui_set(v.u.ui, "title", z_str(t));
     }
+    if (npos > 1) z_ui_set(v.u.ui, "width", pos[1]);
+    if (npos > 2) z_ui_set(v.u.ui, "height", pos[2]);
     return v;
   }
   if (!strcmp(name, "ui.run")) {
     if (npos && z_unwrap(pos[0]).tag == Z_UI && z_unwrap(pos[0]).u.ui)
-      z_ui_render(z_unwrap(pos[0]).u.ui, 0);
+      z_ui_host_run(z_unwrap(pos[0]).u.ui);
     return ZNOTHING;
   }
   if (!strcmp(name, "nav.go")) return z_errv("navigation unavailable", "nav.go");

@@ -5,6 +5,11 @@ edition = "2024"
 license = "Apache-2.0"
 description = "Zappr compiler and toolchain: one binary, compiler, build driver, runner, package manager and formatter."
 
+[lib]
+name = "zapgui"
+path = "src/lib.rs"
+crate-type = ["staticlib", "rlib"]
+
 [[bin]]
 name = "zap"
 path = "src/main.rs"
