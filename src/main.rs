@@ -174,10 +174,21 @@ fn try_call(vm: &mut interp::Vm, name: &str) -> Option<()> {
     }
 }
 
-fn cmd_fmt(_rest: &[String]) -> Result<(), String> {
+fn cmd_fmt(rest: &[String]) -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let p = project::load(&cwd, true)?;
-    crate::fmt::run(&p.root)
+    let root = project::find_root(&cwd)?;
+    if let Some(i) = rest.iter().position(|a| a == "--into") {
+        let folder = rest.get(i + 1).ok_or("usage: zap fmt --into <folder>")?;
+        return crate::fmt::organize_pub(&root, folder);
+    }
+    if rest.iter().any(|a| a == "--split-plan") {
+        let only = rest.iter().position(|a| a == "--split-plan").and_then(|i| rest.get(i + 1)).map(String::as_str);
+        return crate::fmt::split_plan_pub(&root, only);
+    }
+    if rest.iter().any(|a| a == "--split") {
+        return crate::fmt::split_apply_pub(&root);
+    }
+    crate::fmt::run(&root)
 }
 
 fn cmd_verify(rest: &[String]) -> Result<(), String> {

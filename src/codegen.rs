@@ -20,8 +20,90 @@ fn zap_tmp_dir() -> PathBuf {
     d
 }
 
-/// `zap build` entry point.
-pub fn build(p: &Project, _vm: &mut Vm, target: &str) -> Result<(), String> {
+/// `zap build` entry point — content-hash artifact cache (§21).
+pub fn build(p: &Project, vm: &mut Vm, target: &str) -> Result<(), String> {
+    let key = build_cache_key(p, target);
+    let cdir = artifact_cache_dir();
+    let cfile = cdir.join(format!("{key:016x}"));
+    let meta = cdir.join(format!("{key:016x}.json"));
+
+    // figure out expected outputs for this target
+    let is_web = matches!(target, "web" | "wasm" | "wasm32");
+    let out_name = match target {
+        "linux" | "linux-x86_64" => "zap-out",
+        "windows" | "windows-x86_64" => "zap-out.exe",
+        _ => "zap-out.wasm",
+    };
+    let out = PathBuf::from(out_name);
+    let html = out.with_extension("html");
+
+    // cache hit: artifact + optional html sidecar present and fresh
+    if cfile.exists() && std::fs::metadata(&cfile).map(|m| m.len() > 0).unwrap_or(false)
+        && (!is_web || html.exists() || std::fs::metadata(cdir.join(format!("{key:016x}.html"))).is_ok())
+    {
+        std::fs::copy(&cfile, &out).map_err(|e| format!("cache restore failed: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o755));
+        }
+        if is_web {
+            let hp = cdir.join(format!("{key:016x}.html"));
+            if hp.exists() {
+                std::fs::copy(&hp, &html).map_err(|e| format!("cache restore failed: {e}"))?;
+            }
+        }
+        println!("built {} (cached)", out.display());
+        return Ok(());
+    }
+
+    build_inner(p, vm, target)?;
+
+    // populate cache
+    if let Ok(bytes) = std::fs::read(&out) {
+        let _ = std::fs::write(&cfile, &bytes);
+        let _ = std::fs::write(&meta, format!("target={target}"));
+        if is_web {
+            if let Ok(h) = std::fs::read(&html) {
+                let _ = std::fs::write(cdir.join(format!("{key:016x}.html")), &h);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn artifact_cache_dir() -> PathBuf {
+    let base = std::env::var("XDG_CACHE_HOME").map(PathBuf::from).ok()
+        .or_else(|| std::env::var("HOME").map(|h| PathBuf::from(h).join(".cache")).ok());
+    let d = base.unwrap_or_else(std::env::temp_dir).join("zap").join("artifacts");
+    let _ = std::fs::create_dir_all(&d);
+    d
+}
+
+/// Content key over everything that can change the artifact: all module
+/// sources, Zappr.yaml, cli files, sign key, target, tool version (§21).
+fn build_cache_key(p: &Project, target: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    target.hash(&mut h);
+    p.config.sign.hash(&mut h);
+    env!("CARGO_PKG_VERSION").hash(&mut h);
+    for (m, path, _) in &p.modules {
+        m.hash(&mut h);
+        path.hash(&mut h);
+        if let Ok(b) = std::fs::read(path) { b.hash(&mut h); }
+    }
+    if let Ok(b) = std::fs::read(p.root.join("Zappr.yaml")) { b.hash(&mut h); }
+    for rel in &p.config.cli {
+        if let Ok(b) = std::fs::read(p.root.join(rel)) { b.hash(&mut h); }
+    }
+    if let Some(k) = &p.config.sign_key {
+        if let Ok(b) = std::fs::read(p.root.join(k)) { b.hash(&mut h); }
+    }
+    h.finish()
+}
+
+fn build_inner(p: &Project, _vm: &mut Vm, target: &str) -> Result<(), String> {
     let out = match target {
         "linux" | "linux-x86_64" => PathBuf::from("zap-out"),
         "windows" | "windows-x86_64" => PathBuf::from("zap-out.exe"),

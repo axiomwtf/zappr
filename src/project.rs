@@ -164,7 +164,7 @@ pub fn load(dir: &Path, include_tests: bool) -> Result<Project, String> {
     })
 }
 
-fn find_root(dir: &Path) -> Result<PathBuf, String> {
+pub fn find_root(dir: &Path) -> Result<PathBuf, String> {
     let mut cur = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     loop {
         if cur.join("Zappr.yaml").exists() {
