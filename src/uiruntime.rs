@@ -5,8 +5,8 @@
 //! the wasm target. Element semantics (mutate → update, frame-locked,
 //! lazy dirty tracking) live here so both backends share them.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Mutex;
+use std::sync::Arc;
 
 /// One UI element. Elements are values; setting a property updates it.
 #[derive(Debug)]
@@ -14,10 +14,10 @@ pub struct UiElement {
     pub kind: String,
     /// ordered props; mutation marks dirty → next tick renders one frame
     pub props: Vec<(String, crate::value::Value)>,
-    pub children: Vec<Rc<RefCell<UiElement>>>,
+    pub children: Vec<Arc<Mutex<UiElement>>>,
     pub dirty: bool,
     /// event handlers: event name → callback (stored as Rc'd func value)
-    pub handlers: Vec<(String, Rc<crate::value::FuncVal>)>,
+    pub handlers: Vec<(String, Arc<crate::value::FuncVal>)>,
 }
 
 impl UiElement {
@@ -52,11 +52,11 @@ impl UiElement {
 /// The runtime: window registry, routes, navigation log, frame state.
 #[derive(Debug, Default)]
 pub struct UiRuntime {
-    pub windows: Vec<Rc<RefCell<UiElement>>>,
+    pub windows: Vec<Arc<Mutex<UiElement>>>,
     pub routes: Vec<String>,
     pub navigations: Vec<String>,
     pub next_window: u32,
-    pub last_handler: Option<Rc<crate::value::FuncVal>>,
+    pub last_handler: Option<Arc<crate::value::FuncVal>>,
     /// frame counter — frames emit only on tick boundaries (§16.2)
     pub frame: u64,
     /// dirty windows awaiting render
@@ -89,12 +89,12 @@ impl UiRuntime {
         }
         // attach to parent's children when parent is a Ui value
         if let crate::value::Value::Ui(parent_el) = parent {
-            let mut p = parent_el.borrow_mut();
-            p.children.push(Rc::new(RefCell::new(el)));
+            let mut p = parent_el.lock().unwrap();
+            p.children.push(Arc::new(Mutex::new(el)));
             p.dirty = true;
             return crate::value::Value::Ui(p.children.last().unwrap().clone());
         }
-        crate::value::Value::Ui(Rc::new(RefCell::new(el)))
+        crate::value::Value::Ui(Arc::new(Mutex::new(el)))
     }
 
     /// `ui.window("demo", 800, 600)` → window element + registry entry.
@@ -110,7 +110,7 @@ impl UiRuntime {
             "height",
             args.get(2).cloned().unwrap_or(crate::value::Value::Int(600)),
         );
-        let rc = Rc::new(RefCell::new(el));
+        let rc = Arc::new(Mutex::new(el));
         self.windows.push(rc.clone());
         crate::value::Value::Ui(rc)
     }

@@ -1,10 +1,9 @@
 //! Runtime values: the one kind of thing in Zappr is values (SPEC §7.4).
 //! Types are values too.
 
-use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::rc::Rc;
+use std::sync::{Arc, Condvar, Mutex};
 
 /// Type representations — values in their own right.
 #[derive(Debug, Clone, PartialEq)]
@@ -72,19 +71,19 @@ impl TypeRepr {
 pub enum Value {
     Int(i128),
     Float(f64),
-    Str(Rc<RefCell<String>>),
+    Str(Arc<Mutex<String>>),
     Bool(bool),
-    Bytes(Rc<RefCell<Vec<u8>>>),
+    Bytes(Arc<Mutex<Vec<u8>>>),
     /// unnamed tuple — also serves as list element storage via List
-    Tuple(Rc<RefCell<Vec<Value>>>),
+    Tuple(Arc<Mutex<Vec<Value>>>),
     /// named record: ordered fields, `.name` and `.0` both work
     Record {
         ty: String,
-        fields: Rc<RefCell<Vec<(String, Value)>>>,
+        fields: Arc<Mutex<Vec<(String, Value)>>>,
     },
-    List(Rc<RefCell<Vec<Value>>>),
-    Map(Rc<RefCell<Vec<(Value, Value)>>>),
-    Func(Rc<FuncVal>),
+    List(Arc<Mutex<Vec<Value>>>),
+    Map(Arc<Mutex<Vec<(Value, Value)>>>),
+    Func(Arc<FuncVal>),
     /// a type used as a value: `!T = User`, `List(int)`
     Type(TypeRepr),
     /// union variant tag for match narrowing — wraps a value with its variant name
@@ -92,7 +91,7 @@ pub enum Value {
         name: String,
         inner: Box<Value>,
     },
-    Err(Rc<ErrVal>),
+    Err(Arc<ErrVal>),
     /// poison values (§8.1, §9.3): wrongReturnType, missingArg, exclusiveAccess
     Poison {
         kind: PoisonKind,
@@ -100,10 +99,10 @@ pub enum Value {
         expected: String,
         actual: String,
     },
-    Channel(Rc<RefCell<ChannelState>>),
-    Weak(Rc<RefCell<Value>>),
+    Channel(Arc<ChannelShared>),
+    Weak(Arc<Mutex<Value>>),
     /// UI element — native renderer / DOM bridge share this value (§16)
-    Ui(Rc<RefCell<crate::uiruntime::UiElement>>),
+    Ui(Arc<Mutex<crate::uiruntime::UiElement>>),
     Nothing,
 }
 
@@ -131,7 +130,7 @@ pub struct ErrVal {
 }
 
 /// Lexical environment: stack of scopes (innermost last).
-pub type Env = Vec<Rc<RefCell<HashMap<String, Value>>>>;
+pub type Env = Vec<Arc<Mutex<HashMap<String, Value>>>>;
 
 #[derive(Debug)]
 pub struct FuncVal {
@@ -170,7 +169,7 @@ pub enum BuiltinFn {
     Exit,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ChannelState {
     pub queue: VecDeque<Value>,
     pub closed: bool,
@@ -178,9 +177,70 @@ pub struct ChannelState {
     pub cap: usize,
 }
 
+/// A channel's shared half: state plus the condvar both sides wait on (§14).
+#[derive(Debug)]
+pub struct ChannelShared {
+    st: Mutex<ChannelState>,
+    cv: Condvar,
+}
+
+impl ChannelShared {
+    pub fn new(cap: usize) -> Self {
+        ChannelShared {
+            st: Mutex::new(ChannelState {
+                queue: VecDeque::new(),
+                closed: false,
+                cap,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Blocking send (§14). Blocks while a bounded channel is full;
+    /// errors if the channel is closed.
+    pub fn send(&self, v: Value) -> Result<(), String> {
+        let mut g = self.st.lock().unwrap();
+        while g.cap > 0 && g.queue.len() >= g.cap && !g.closed {
+            g = self.cv.wait(g).unwrap();
+        }
+        if g.closed {
+            return Err("send on closed channel".into());
+        }
+        g.queue.push_back(v);
+        drop(g);
+        self.cv.notify_all();
+        Ok(())
+    }
+
+    /// Blocking receive. Returns `None` only when the channel is closed
+    /// and drained — the "drain until closed" rule (§14).
+    pub fn recv(&self) -> Option<Value> {
+        let mut g = self.st.lock().unwrap();
+        loop {
+            if let Some(v) = g.queue.pop_front() {
+                drop(g);
+                self.cv.notify_all();
+                return Some(v);
+            }
+            if g.closed {
+                return None;
+            }
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+
+    /// Close the channel: wakes every waiter; queued values stay receivable.
+    pub fn close(&self) {
+        let mut g = self.st.lock().unwrap();
+        g.closed = true;
+        drop(g);
+        self.cv.notify_all();
+    }
+}
+
 impl Value {
     pub fn str(s: impl Into<String>) -> Value {
-        Value::Str(Rc::new(RefCell::new(s.into())))
+        Value::Str(Arc::new(Mutex::new(s.into())))
     }
 
     pub fn truthy(&self) -> bool {
@@ -188,11 +248,11 @@ impl Value {
             Value::Bool(b) => *b,
             Value::Int(i) => *i != 0,
             Value::Float(f) => *f != 0.0,
-            Value::Str(s) => !s.borrow().is_empty(),
-            Value::List(l) => !l.borrow().is_empty(),
-            Value::Map(m) => !m.borrow().is_empty(),
-            Value::Tuple(t) => !t.borrow().is_empty(),
-            Value::Record { fields, .. } => !fields.borrow().is_empty(),
+            Value::Str(s) => !s.lock().unwrap().is_empty(),
+            Value::List(l) => !l.lock().unwrap().is_empty(),
+            Value::Map(m) => !m.lock().unwrap().is_empty(),
+            Value::Tuple(t) => !t.lock().unwrap().is_empty(),
+            Value::Record { fields, .. } => !fields.lock().unwrap().is_empty(),
             Value::Nothing => false,
             Value::Type(_) => true,
             Value::Func(_) => true,
@@ -202,7 +262,7 @@ impl Value {
             Value::Poison { .. } => false,
             Value::Variant { inner, .. } => inner.truthy(),
             Value::Weak(_) => true,
-            Value::Bytes(b) => !b.borrow().is_empty(),
+            Value::Bytes(b) => !b.lock().unwrap().is_empty(),
         }
     }
 
@@ -215,12 +275,12 @@ impl Value {
             Value::Bytes(_) => TypeRepr::Bytes,
             Value::Tuple(t) => TypeRepr::Tuple(
                 // homogeneous unknown — element types aren't tracked; Any per slot
-                vec![TypeRepr::Any; t.borrow().len()],
+                vec![TypeRepr::Any; t.lock().unwrap().len()],
             ),
             Value::Record { ty, fields } => TypeRepr::Record {
                 name: ty.clone(),
                 fields: fields
-                    .borrow()
+                    .lock().unwrap()
                     .iter()
                     .map(|(n, v)| (n.clone(), v.type_repr()))
                     .collect(),
@@ -261,27 +321,27 @@ impl Value {
             TypeRepr::Poison => matches!(self, Value::Poison { .. }),
             TypeRepr::List(inner) => match self {
                 Value::List(l) => l
-                    .borrow()
+                    .lock().unwrap()
                     .iter()
                     .all(|v| v.satisfies(inner) || matches!(inner.as_ref(), TypeRepr::Any)),
                 _ => false,
             },
             TypeRepr::Map(k, v) => match self {
-                Value::Map(m) => m.borrow().iter().all(|(mk, mv)| {
+                Value::Map(m) => m.lock().unwrap().iter().all(|(mk, mv)| {
                     mk.satisfies(k) && mv.satisfies(v)
                 }),
                 _ => false,
             },
             TypeRepr::Tuple(ts) => match self {
                 Value::Tuple(t) => {
-                    let t = t.borrow();
+                    let t = t.lock().unwrap();
                     t.len() == ts.len()
                         && t.iter()
                             .zip(ts.iter())
                             .all(|(v, ty)| v.satisfies(ty) || matches!(ty, TypeRepr::Any))
                 }
                 Value::Record { fields, .. } => {
-                    let f = fields.borrow();
+                    let f = fields.lock().unwrap();
                     f.len() == ts.len()
                         && f.iter()
                             .zip(ts.iter())
@@ -292,8 +352,8 @@ impl Value {
             TypeRepr::Record { name, fields } => match self {
                 Value::Record { ty, fields: f } => {
                     ty == name
-                        && f.borrow().len() == fields.len()
-                        && f.borrow()
+                        && f.lock().unwrap().len() == fields.len()
+                        && f.lock().unwrap()
                             .iter()
                             .zip(fields.iter())
                             .all(|((_, v), (_, fty))| {
@@ -322,12 +382,12 @@ impl Value {
                     format!("{f}")
                 }
             }
-            Value::Str(s) => s.borrow().clone(),
+            Value::Str(s) => s.lock().unwrap().clone(),
             Value::Bool(b) => b.to_string(),
-            Value::Bytes(b) => format!("<{} bytes>", b.borrow().len()),
+            Value::Bytes(b) => format!("<{} bytes>", b.lock().unwrap().len()),
             Value::Tuple(t) => {
                 let inner = t
-                    .borrow()
+                    .lock().unwrap()
                     .iter()
                     .map(|v| v.display())
                     .collect::<Vec<_>>()
@@ -336,7 +396,7 @@ impl Value {
             }
             Value::Record { ty, fields } => {
                 let inner = fields
-                    .borrow()
+                    .lock().unwrap()
                     .iter()
                     .map(|(n, v)| format!("{n}: {}", v.display()))
                     .collect::<Vec<_>>()
@@ -345,7 +405,7 @@ impl Value {
             }
             Value::List(l) => {
                 let inner = l
-                    .borrow()
+                    .lock().unwrap()
                     .iter()
                     .map(|v| v.display())
                     .collect::<Vec<_>>()
@@ -354,7 +414,7 @@ impl Value {
             }
             Value::Map(m) => {
                 let inner = m
-                    .borrow()
+                    .lock().unwrap()
                     .iter()
                     .map(|(k, v)| format!("{}: {}", k.display(), v.display()))
                     .collect::<Vec<_>>()
@@ -375,7 +435,7 @@ impl Value {
                 kind = kind.name(),
             ),
             Value::Channel(_) => "<channel>".into(),
-            Value::Ui(el) => format!("<ui.{}>", el.borrow().kind),
+            Value::Ui(el) => format!("<ui.{}>", el.lock().unwrap().kind),
             Value::Weak(_) => "<weak>".into(),
             Value::Nothing => "null".into(),
         }
@@ -413,22 +473,22 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
             (*x as f64) == *y
         }
         (Value::Float(x), Value::Float(y)) => x == y,
-        (Value::Str(x), Value::Str(y)) => *x.borrow() == *y.borrow(),
+        (Value::Str(x), Value::Str(y)) => *x.lock().unwrap() == *y.lock().unwrap(),
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Nothing, Value::Nothing) => true,
         (Value::Type(x), Value::Type(y)) => x == y,
         (Value::Tuple(x), Value::Tuple(y)) => {
-            let (x, y) = (x.borrow(), y.borrow());
+            let (x, y) = (x.lock().unwrap(), y.lock().unwrap());
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| values_equal(a, b))
         }
         (Value::List(x), Value::List(y)) => {
-            let (x, y) = (x.borrow(), y.borrow());
+            let (x, y) = (x.lock().unwrap(), y.lock().unwrap());
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| values_equal(a, b))
         }
         (Value::Record { ty: tx, fields: x }, Value::Record { ty: ty, fields: y }) => {
             tx == ty
                 && {
-                    let (x, y) = (x.borrow(), y.borrow());
+                    let (x, y) = (x.lock().unwrap(), y.lock().unwrap());
                     x.len() == y.len()
                         && x.iter().zip(y.iter()).all(|((nx, a), (ny, b))| {
                             nx == ny && values_equal(a, b)
@@ -469,3 +529,11 @@ impl Num {
         }
     }
 }
+
+// §14: values cross task boundaries — the heap must be Send + Sync.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Value>();
+    assert_send_sync::<Env>();
+    assert_send_sync::<FuncVal>();
+};

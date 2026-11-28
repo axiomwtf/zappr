@@ -1332,6 +1332,20 @@ impl Parser {
                     args: vec![inner],
                 })
             }
+            Tok::KwChannel => {
+                // channel(T) — a channel of T (§14)
+                if matches!(self.peek(), Tok::LParen) {
+                    self.bump();
+                    let inner = self.parse_type()?;
+                    self.expect(&Tok::RParen, "`)`")?;
+                    Ok(TypeExpr::App {
+                        name: "channel".into(),
+                        args: vec![inner],
+                    })
+                } else {
+                    Ok(TypeExpr::Named("channel".into()))
+                }
+            }
             _ => Err(ParseError {
                 line: t.line,
                 col: t.col,

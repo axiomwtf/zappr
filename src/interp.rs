@@ -5,11 +5,34 @@
 use crate::parser::{
     BinOp, Expr, ForPat, Item, MatchArm, Param, Program, Stmt, StrPart, TypeExpr, UnOp,
 };
-use crate::value::{values_equal, BuiltinFn, ChannelState, ErrVal, FuncVal, Num, PoisonKind, TypeRepr, Value};
+use crate::value::{values_equal, BuiltinFn, ChannelShared, ErrVal, FuncVal, Num, PoisonKind, TypeRepr, Value};
 use crate::value::Env as Scope;
-use std::cell::RefCell;
+use std::sync::Mutex;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::sync::Arc;
+
+/// Detached `spawn`ed tasks (§14) — joined before the program exits so
+/// no task is ever orphaned.
+static SPAWNED_TASKS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// Join every spawned task. Called at program end (run_main): a Zappr
+/// program outlives its tasks by construction — no orphans, guaranteed.
+pub fn join_spawned_tasks() {
+    let handles: Vec<_> = SPAWNED_TASKS.lock().unwrap().drain(..).collect();
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
+/// Names a statement declares at the top level of a `parallel` body —
+/// the block's static publish surface (§14).
+fn stmt_decl_names(stmt: &Stmt) -> Vec<String> {
+    match stmt {
+        Stmt::Decl { name, .. } => vec![name.clone()],
+        Stmt::DeclTuple { names, .. } => names.clone(),
+        _ => Vec::new(),
+    }
+}
 
 #[derive(Debug)]
 pub enum Flow {
@@ -25,33 +48,46 @@ pub struct RuntimeError {
     pub line: usize,
 }
 
-pub struct Vm {
-    /// all function bodies across all loaded modules, flat
-    fns: Vec<FnDef>,
+/// Program state, read-only after load — shared with task threads (§14).
+/// One `Arc<Prog>` is cloned into every `parallel` child and `spawn`ed
+/// task instead of the whole AST being re-parsed or copied.
+pub struct Prog {
+    /// all function bodies across all loaded modules, flat. `Arc` per fn so
+    /// readers clone the handle and drop the lock before executing (lambdas
+    /// register into this table at runtime — §14 task threads share it).
+    pub fns: std::sync::RwLock<Vec<Arc<FnDef>>>,
     /// name → fn indices (a name may exist in several modules)
-    fn_map: HashMap<String, Vec<usize>>,
+    pub fn_map: HashMap<String, Vec<usize>>,
     /// module namespace → module
-    modules: HashMap<String, Module>,
-    /// module of the function currently executing (for bare-name resolution)
-    cur_module: String,
-    /// global scope (module top-level decls live in their module scope)
-    scopes: Scope,
+    pub modules: HashMap<String, Module>,
     /// entry module name (main.znz → "main")
     pub entry: String,
     /// zapYaml vals from Zappr.yaml
     pub zap_yaml: Value,
-    /// ui element registry for the (stub) ui runtime
-    pub ui: crate::uiruntime::UiRuntime,
-    /// line number tracking for errors
-    cur_line: usize,
+    /// ui element registry — shared, mutated by ui builtins on any task
+    pub ui: Arc<Mutex<crate::uiruntime::UiRuntime>>,
     /// argv for the running program / custom cli command (§9.5)
     pub cli_args: Vec<String>,
     /// owning project (set by vm_for) — lets ui.run hand off to the
     /// compiled native renderer (§16)
     pub project: Option<std::sync::Arc<crate::project::Project>>,
+}
+
+pub struct Vm {
+    /// read-only program + config, shared across task threads
+    pub prog: Arc<Prog>,
+    /// module of the function currently executing (for bare-name resolution)
+    cur_module: String,
+    /// global scope (module top-level decls live in their module scope)
+    scopes: Scope,
+    /// line number tracking for errors
+    pub cur_line: usize,
     /// §15.1 runtime exclusivity guard: per-cell access flags for borrows
     /// that escaped the checker's sight (closures, stored fields, tasks)
-    access: Rc<RefCell<AccessInner>>,
+    access: Arc<Mutex<AccessInner>>,
+    /// §14 cancellation flag for tasks inside a failing `parallel` block —
+    /// checked at statement safe points; None on the main Vm
+    cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Live access state for one guarded cell (§15.1).
@@ -73,7 +109,7 @@ struct AccessInner {
 
 /// RAII access permit — releases the cell's read/write slot on drop.
 struct AccessPermit {
-    inner: Rc<RefCell<AccessInner>>,
+    inner: Arc<Mutex<AccessInner>>,
     key: usize,
     write: bool,
     armed: bool,
@@ -81,7 +117,7 @@ struct AccessPermit {
 
 impl AccessPermit {
     fn disarmed() -> Self {
-        AccessPermit { inner: Rc::new(RefCell::new(AccessInner::default())), key: 0, write: false, armed: false }
+        AccessPermit { inner: Arc::new(Mutex::new(AccessInner::default())), key: 0, write: false, armed: false }
     }
 }
 
@@ -90,7 +126,7 @@ impl Drop for AccessPermit {
         if !self.armed {
             return;
         }
-        let mut g = self.inner.borrow_mut();
+        let mut g = self.inner.lock().unwrap();
         if let Some(a) = g.active.get_mut(&self.key) {
             if self.write {
                 a.writer = false;
@@ -124,25 +160,59 @@ pub struct Module {
 impl Vm {
     pub fn new() -> Self {
         Vm {
-            fns: Vec::new(),
-            fn_map: HashMap::new(),
-            modules: HashMap::new(),
+            prog: Arc::new(Prog {
+                fns: std::sync::RwLock::new(Vec::new()),
+                fn_map: HashMap::new(),
+                modules: HashMap::new(),
+                entry: "main".into(),
+                zap_yaml: Value::Map(Arc::new(Mutex::new(Vec::new()))),
+                ui: Arc::new(Mutex::new(crate::uiruntime::UiRuntime::new())),
+                cli_args: Vec::new(),
+                project: None,
+            }),
             cur_module: "main".into(),
-            scopes: vec![Rc::new(RefCell::new(HashMap::new()))],
-            entry: "main".into(),
-            zap_yaml: Value::Map(Rc::new(RefCell::new(Vec::new()))),
-            ui: crate::uiruntime::UiRuntime::new(),
+            scopes: vec![Arc::new(Mutex::new(HashMap::new()))],
             cur_line: 0,
-            cli_args: Vec::new(),
-            project: None,
-            access: Rc::new(RefCell::new(AccessInner::default())),
+            access: Arc::new(Mutex::new(AccessInner::default())),
+            cancel: None,
         }
+    }
+
+    /// A task-thread Vm sharing the program, the §15.1 guard and the
+    /// enclosing scopes — with its own cancel flag and cursor state (§14).
+    fn fork_task(&self, cancel: Option<Arc<std::sync::atomic::AtomicBool>>) -> Vm {
+        Vm {
+            prog: self.prog.clone(),
+            cur_module: self.cur_module.clone(),
+            scopes: self.scopes.clone(),
+            cur_line: self.cur_line,
+            access: self.access.clone(),
+            cancel,
+        }
+    }
+
+    /// Load-time setters — call before any task thread exists; they take
+    /// the one remaining strong reference apart via `Arc::get_mut`.
+    fn prog_mut(&mut self) -> &mut Prog {
+        Arc::get_mut(&mut self.prog).expect("prog mutated after task threads started")
+    }
+
+    pub fn set_cli_args(&mut self, args: Vec<String>) {
+        self.prog_mut().cli_args = args;
+    }
+
+    pub fn set_project(&mut self, p: Option<std::sync::Arc<crate::project::Project>>) {
+        self.prog_mut().project = p;
+    }
+
+    pub fn set_zap_yaml(&mut self, v: Value) {
+        self.prog_mut().zap_yaml = v;
     }
 
     // ---------- scope helpers ----------
 
     fn push_scope(&mut self) {
-        self.scopes.push(Rc::new(RefCell::new(HashMap::new())));
+        self.scopes.push(Arc::new(Mutex::new(HashMap::new())));
     }
 
     fn pop_scope(&mut self) {
@@ -152,7 +222,7 @@ impl Vm {
     fn declare(&mut self, name: &str, val: Value) -> Result<(), RuntimeError> {
         // no-shadowing (§6.3): name must not exist in any enclosing scope
         for s in self.scopes.iter().rev() {
-            if s.borrow().contains_key(name) {
+            if s.lock().unwrap().contains_key(name) {
                 return Err(RuntimeError {
                     msg: format!("redeclaration of `{name}` — names are declared exactly once (SPEC §6.3)"),
                     line: self.cur_line,
@@ -164,7 +234,7 @@ impl Vm {
             .enter_scope(&scope, true, &format!("declare `{name}`"))
             .map_err(|m| RuntimeError { msg: m, line: self.cur_line })?;
         self.escape_value(&val);
-        scope.borrow_mut().insert(name.to_string(), val);
+        scope.lock().unwrap().insert(name.to_string(), val);
         Ok(())
     }
 
@@ -173,14 +243,14 @@ impl Vm {
             .scopes
             .iter()
             .rev()
-            .find(|s| s.borrow().contains_key(name))
+            .find(|s| s.lock().unwrap().contains_key(name))
             .cloned();
         if let Some(s) = found {
             let _p = self
                 .enter_scope(&s, true, &format!("assign `{name}`"))
                 .map_err(|m| RuntimeError { msg: m, line: self.cur_line })?;
             self.escape_value(&val);
-            s.borrow_mut().insert(name.to_string(), val);
+            s.lock().unwrap().insert(name.to_string(), val);
             return Ok(());
         }
         Err(RuntimeError {
@@ -202,7 +272,7 @@ impl Vm {
                     })
                 }
             };
-            if let Some(v) = s.borrow().get(name) {
+            if let Some(v) = s.lock().unwrap().get(name) {
                 return Some(v.clone());
             }
         }
@@ -211,8 +281,8 @@ impl Vm {
 
     // ---------- §15.1 exclusivity guard ----------
 
-    fn cell_key<T>(rc: &Rc<RefCell<T>>) -> usize {
-        Rc::as_ptr(rc) as usize
+    fn cell_key<T>(rc: &Arc<T>) -> usize {
+        Arc::as_ptr(rc) as usize
     }
 
     /// Identity of a shared value's storage cell, if it has one.
@@ -237,6 +307,13 @@ impl Vm {
     /// Unguarded cells cost one hash lookup and no tracking (§15.1: the
     /// flag is only carried where borrows escape the checker).
     fn enter_val(&self, v: &Value, write: bool, origin: &str) -> Result<AccessPermit, String> {
+        // Channels are exempt from the §15.1 cell guard: a channel is its
+        // own synchronization (Mutex + Condvar inside), and concurrent
+        // send/recv across tasks is the sanctioned use (§14). Guarding the
+        // cell would forbid the one pattern the channel exists for.
+        if matches!(v, Value::Channel(_)) {
+            return Ok(AccessPermit::disarmed());
+        }
         let Some(key) = Self::value_key(v) else {
             return Ok(AccessPermit::disarmed());
         };
@@ -245,7 +322,7 @@ impl Vm {
 
     fn enter_scope(
         &self,
-        scope: &Rc<RefCell<HashMap<String, Value>>>,
+        scope: &Arc<Mutex<HashMap<String, Value>>>,
         write: bool,
         origin: &str,
     ) -> Result<AccessPermit, String> {
@@ -261,7 +338,7 @@ impl Vm {
     ) -> Result<AccessPermit, String> {
         let inner = self.access.clone();
         let armed = {
-            let mut g = inner.borrow_mut();
+            let mut g = inner.lock().unwrap();
             if !(always || g.guarded.contains(&key)) {
                 false
             } else {
@@ -308,14 +385,14 @@ impl Vm {
         // values whose sharing lives outside their own cell
         match v {
             Value::Func(f) => {
-                let id = Rc::as_ptr(f) as usize;
+                let id = Arc::as_ptr(f) as usize;
                 if seen.insert(id) {
                     self.escape_env_seen(&f.env, seen);
                 }
                 return;
             }
             Value::Weak(w) => {
-                let inner = w.borrow().clone();
+                let inner = w.lock().unwrap().clone();
                 self.escape_value_seen(&inner, seen);
                 return;
             }
@@ -330,7 +407,7 @@ impl Vm {
             return;
         }
         {
-            let mut g = self.access.borrow_mut();
+            let mut g = self.access.lock().unwrap();
             if !g.guarded.insert(key) {
                 return; // already escaped — children were covered then
             }
@@ -338,23 +415,23 @@ impl Vm {
         // newly guarded: cover nested storage so deep escapes are seen
         match v {
             Value::Tuple(t) => {
-                for x in t.borrow().iter() {
+                for x in t.lock().unwrap().iter() {
                     self.escape_value_seen(x, seen);
                 }
             }
             Value::List(l) => {
-                for x in l.borrow().iter() {
+                for x in l.lock().unwrap().iter() {
                     self.escape_value_seen(x, seen);
                 }
             }
             Value::Map(m) => {
-                for (k, x) in m.borrow().iter() {
+                for (k, x) in m.lock().unwrap().iter() {
                     self.escape_value_seen(k, seen);
                     self.escape_value_seen(x, seen);
                 }
             }
             Value::Record { fields, .. } => {
-                for (_, x) in fields.borrow().iter() {
+                for (_, x) in fields.lock().unwrap().iter() {
                     self.escape_value_seen(x, seen);
                 }
             }
@@ -378,13 +455,13 @@ impl Vm {
                 continue;
             }
             let fresh = {
-                let mut g = self.access.borrow_mut();
+                let mut g = self.access.lock().unwrap();
                 g.guarded.insert(key)
             };
             if !fresh {
                 continue; // already escaped — its bindings covered then
             }
-            for (_, v) in scope.borrow().iter() {
+            for (_, v) in scope.lock().unwrap().iter() {
                 self.escape_value_seen(v, seen);
             }
         }
@@ -398,7 +475,7 @@ impl Vm {
 
     /// Load a parsed module: register its functions under its namespace.
     pub fn load_module(&mut self, module_name: &str, prog: &Program) -> Result<(), RuntimeError> {
-        let module_scope = vec![Rc::new(RefCell::new(HashMap::new()))];
+        let module_scope = vec![Arc::new(Mutex::new(HashMap::new()))];
         let mut fn_ids = Vec::new();
         for item in &prog.items {
             match item {
@@ -409,8 +486,9 @@ impl Vm {
                     line,
                 } => {
                     let _ = line;
-                    let id = self.fns.len();
-                    self.fns.push(FnDef {
+                    let p = self.prog_mut();
+                    let id = p.fns.read().unwrap().len();
+                    p.fns.write().unwrap().push(Arc::new(FnDef {
                         name: name.clone(),
                         module: module_name.to_string(),
                         params: params
@@ -419,10 +497,10 @@ impl Vm {
                             .collect(),
                         body: body.clone(),
                         env: module_scope.clone(),
-                    });
-                    self.fn_map.entry(name.clone()).or_default().push(id);
+                    }));
+                    p.fn_map.entry(name.clone()).or_default().push(id);
                     // qualified name resolves from anywhere
-                    self.fn_map
+                    p.fn_map
                         .entry(format!("{module_name}.{name}"))
                         .or_default()
                         .push(id);
@@ -431,7 +509,8 @@ impl Vm {
                 Item::Use(_) => {}
             }
         }
-        self.modules.insert(
+        let p = self.prog_mut();
+        p.modules.insert(
             module_name.to_string(),
             Module {
                 name: module_name.to_string(),
@@ -445,11 +524,11 @@ impl Vm {
     pub fn resolve_use(&self, path: &[String]) -> Option<String> {
         // path segments fuse: http/auth/session → httpAuthSession
         let fused = fuse_name(path);
-        if self.modules.contains_key(&fused) {
+        if self.prog.modules.contains_key(&fused) {
             return Some(fused);
         }
         // maybe path already is the fused name in one segment
-        if path.len() == 1 && self.modules.contains_key(&path[0]) {
+        if path.len() == 1 && self.prog.modules.contains_key(&path[0]) {
             return Some(path[0].clone());
         }
         None
@@ -458,10 +537,10 @@ impl Vm {
     /// `module.fn` → callable value
     pub fn module_fn(&self, module: &str, fname: &str) -> Option<Value> {
         let key = format!("{module}.{fname}");
-        let ids = self.fn_map.get(&key)?;
+        let ids = self.prog.fn_map.get(&key)?;
         let id = *ids.first()?;
-        let f = &self.fns[id];
-        Some(Value::Func(Rc::new(FuncVal {
+        let f = self.prog.fns.read().unwrap()[id].clone();
+        Some(Value::Func(Arc::new(FuncVal {
             name: format!("{module}.{fname}"),
             params: f.params.iter().map(|(n, _)| n.clone()).collect(),
             param_types: f
@@ -480,7 +559,7 @@ impl Vm {
     /// Call a function by qualified or bare name (used by `zap test`, CLI cmds).
     pub fn call_named(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
         let ids = self
-            .fn_map
+            .prog.fn_map
             .get(name)
             .cloned()
             .ok_or_else(|| RuntimeError {
@@ -490,7 +569,7 @@ impl Vm {
         let id = ids
             .iter()
             .copied()
-            .find(|id| self.fns[*id].module == self.cur_module)
+            .find(|id| self.prog.fns.read().unwrap()[*id].module == self.cur_module)
             .or_else(|| ids.first().copied())
             .unwrap();
         self.call_fn_id(id, args)
@@ -498,27 +577,59 @@ impl Vm {
 
     pub fn run_main(&mut self) -> Result<Value, RuntimeError> {
         // find main() — prefer entry module's main, else any main
-        let key = format!("{}.main", self.entry);
+        let key = format!("{}.main", self.prog.entry);
         let id = self
-            .fn_map
+            .prog.fn_map
             .get(&key)
             .and_then(|v| v.first().copied())
             .or_else(|| {
-                self.fn_map
+                self.prog.fn_map
                     .get("main")
                     .and_then(|v| v.first().copied())
             })
             .ok_or_else(|| RuntimeError {
-                msg: format!("no `main()` found (entry module `{}`)", self.entry),
+                msg: format!("no `main()` found (entry module `{}`)", self.prog.entry),
                 line: 0,
             })?;
-        self.call_fn_id(id, Vec::new())
+        let r = self.call_fn_id(id, Vec::new());
+        // §14: the program outlives its spawned tasks — join them all
+        join_spawned_tasks();
+        r
+    }
+
+    /// Resolve a spawn/parallel callee to a callable `Func` value: a Func
+    /// variable, or a user fn by (bare or module-qualified) name.
+    fn resolve_callee_func(&self, callee: &Expr) -> Option<Value> {
+        let Expr::Ident(name) = callee else {
+            return None;
+        };
+        if let Some(v) = self.get(name) {
+            if matches!(v, Value::Func(_)) {
+                return Some(v);
+            }
+        }
+        let ids = self
+            .prog
+            .fn_map
+            .get(name)
+            .cloned()
+            .or_else(|| self.prog.fn_map.get(&format!("{}.{}", self.cur_module, name)).cloned())?;
+        let id = *ids.first()?;
+        // the table already holds Arc<FnDef> per fn — clone the handle
+        Some(Value::Func(Arc::new(FuncVal {
+            name: self.prog.fns.read().unwrap()[id].name.clone(),
+            params: self.prog.fns.read().unwrap()[id].params.iter().map(|(n, _)| n.clone()).collect(),
+            param_types: vec![None; self.prog.fns.read().unwrap()[id].params.len()],
+            body_id: id,
+            env: self.prog.fns.read().unwrap()[id].env.clone(),
+            builtin: None,
+        })))
     }
 
     fn call_fn_id(&mut self, id: usize, args: Vec<Value>) -> Result<Value, RuntimeError> {
         // clone what we need; fns vec isn't mutated during call
         let (name, params, body, env, module) = {
-            let f = &self.fns[id];
+            let f = self.prog.fns.read().unwrap()[id].clone();
             (
                 f.name.clone(),
                 f.params.clone(),
@@ -551,11 +662,11 @@ impl Vm {
         // `args` magic binding: args.count / args.rest
         let args_val = Value::Record {
             ty: "args".into(),
-            fields: Rc::new(RefCell::new(vec![
+            fields: Arc::new(Mutex::new(vec![
                 ("count".into(), Value::Int(args.len() as i128)),
                 (
                     "rest".into(),
-                    Value::List(Rc::new(RefCell::new(rest))),
+                    Value::List(Arc::new(Mutex::new(rest))),
                 ),
             ])),
         };
@@ -571,6 +682,18 @@ impl Vm {
 
     fn exec_block(&mut self, body: &[Stmt]) -> Result<Flow, RuntimeError> {
         for stmt in body {
+            // cancellation safe point (§14): a failed parallel sibling stops
+            // this task at the next statement boundary. Err, not Normal —
+            // Normal would let an enclosing for-loop treat it as one done
+            // iteration and keep spinning.
+            if let Some(c) = &self.cancel {
+                if c.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(RuntimeError {
+                        msg: "cancelled — sibling task failed (§14)".into(),
+                        line: self.cur_line,
+                    });
+                }
+            }
             let flow = self.exec_stmt(stmt)?;
             if !matches!(flow, Flow::Normal) {
                 return Ok(flow);
@@ -601,8 +724,8 @@ impl Vm {
                         line: *line,
                     })?;
                 let items = match &v {
-                    Value::Tuple(t) => t.borrow().clone(),
-                    Value::List(l) => l.borrow().clone(),
+                    Value::Tuple(t) => t.lock().unwrap().clone(),
+                    Value::List(l) => l.lock().unwrap().clone(),
                     _ => vec![v.clone()],
                 };
                 for (i, n) in names.iter().enumerate() {
@@ -772,7 +895,7 @@ impl Vm {
                 loop {
                     let next = match &it {
                         Value::List(l) => {
-                            let l = l.borrow();
+                            let l = l.lock().unwrap();
                             if idx >= l.len() {
                                 None
                             } else {
@@ -780,7 +903,7 @@ impl Vm {
                             }
                         }
                         Value::Tuple(t) => {
-                            let t = t.borrow();
+                            let t = t.lock().unwrap();
                             if idx >= t.len() {
                                 None
                             } else {
@@ -788,17 +911,17 @@ impl Vm {
                             }
                         }
                         Value::Map(m) => {
-                            let m = m.borrow();
+                            let m = m.lock().unwrap();
                             if idx >= m.len() {
                                 None
                             } else {
                                 let (k, v) = m[idx].clone();
-                                Some(Value::Tuple(Rc::new(RefCell::new(vec![k, v]))))
+                                Some(Value::Tuple(Arc::new(Mutex::new(vec![k, v]))))
                             }
                         }
                         Value::Channel(ch) => {
-                            let mut ch = ch.borrow_mut();
-                            ch.queue.pop_front()
+                            // drain until closed (§14) — blocks on empty
+                            ch.recv()
                         }
                         _ => {
                             return Err(RuntimeError {
@@ -815,8 +938,8 @@ impl Vm {
                         }
                         ForPat::Tuple(names) => {
                             let elems = match &item {
-                                Value::Tuple(t) => t.borrow().clone(),
-                                Value::List(l) => l.borrow().clone(),
+                                Value::Tuple(t) => t.lock().unwrap().clone(),
+                                Value::List(l) => l.lock().unwrap().clone(),
                                 _ => vec![item.clone()],
                             };
                             for (i, n) in names.iter().enumerate() {
@@ -936,36 +1059,142 @@ impl Vm {
             Stmt::Parallel { body, line } => {
                 self.cur_line = *line;
                 self.escape_scopes();
-                // v1: structured concurrency semantics — children run to
-                // completion at the join, decls publish upward. Parallel
-                // execution lands with native codegen; the join guarantee
-                // (no orphans) holds here by construction.
-                self.push_scope();
-                let r = self.exec_block(body);
-                // publish decls upward
-                let inner = self.scopes.pop().unwrap();
-                for (k, v) in inner.borrow().iter() {
-                    self.escape_value(v);
-                    self.scopes
-                        .last()
-                        .unwrap()
-                        .borrow_mut()
-                        .insert(k.clone(), v.clone());
+                // Real §14 parallelism: one OS thread per top-level
+                // statement of the block, joined at the end of the scope.
+                // Children share the enclosing scopes (Mutex-guarded cells)
+                // and publish their own `!` declarations upward at the join.
+                // First failure arms the cancel flag — siblings stop at their
+                // next statement safe point — and every published name
+                // becomes the block's Err (§14 failure rule).
+                use std::sync::atomic::{AtomicBool, Ordering};
+                self.escape_scopes();
+                let cancel = Arc::new(AtomicBool::new(false));
+                let publish: Mutex<Vec<(String, Value)>> = Mutex::new(Vec::new());
+                let first_err: Mutex<Option<RuntimeError>> = Mutex::new(None);
+                let ret_flow: Mutex<Option<Value>> = Mutex::new(None);
+                std::thread::scope(|s| {
+                    for stmt in body {
+                        if cancel.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let cancel = cancel.clone();
+                        let mut child = self.fork_task(Some(cancel.clone()));
+                        let publish = &publish;
+                        let first_err = &first_err;
+                        let ret_flow = &ret_flow;
+                        s.spawn(move || {
+                            child.push_scope();
+                            let r = child.exec_stmt(stmt);
+                            // the child's private scope holds its published decls
+                            let decls: Vec<(String, Value)> = child
+                                .scopes
+                                .pop()
+                                .map(|m| m.lock().unwrap().drain().collect())
+                                .unwrap_or_default();
+                            for (_, v) in &decls {
+                                child.escape_value(v);
+                            }
+                            let mut pubq = publish.lock().unwrap();
+                            match r {
+                                Ok(Flow::Return(v)) => {
+                                    for d in decls {
+                                        pubq.push(d);
+                                    }
+                                    let mut rf = ret_flow.lock().unwrap();
+                                    if rf.is_none() {
+                                        *rf = Some(v);
+                                    }
+                                }
+                                Ok(_) => {
+                                    for d in decls {
+                                        pubq.push(d);
+                                    }
+                                }
+                                Err(e) => {
+                                    // failed children's names are published too,
+                                    // then poisoned at the join
+                                    for d in decls {
+                                        pubq.push(d);
+                                    }
+                                    let mut fe = first_err.lock().unwrap();
+                                    if fe.is_none() {
+                                        *fe = Some(e);
+                                        drop(fe);
+                                        cancel.store(true, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+                // join: all children done or cancelled — no orphans
+                let parent = self.scopes.last().unwrap();
+                let mut pg = parent.lock().unwrap();
+                let mut pubq = publish.lock().unwrap();
+                if let Some(e) = first_err.lock().unwrap().take() {
+                    // §14 failure rule: no exception to throw — the failure
+                    // becomes data. Every name the block published holds the
+                    // same Err; names from cancelled children are poisoned
+                    // too, so the block's full declared surface is present.
+                    let ev = Value::Err(Arc::new(ErrVal {
+                        msg: e.msg.clone(),
+                        origin: format!("line {}", e.line),
+                    }));
+                    for stmt in body {
+                        for name in stmt_decl_names(stmt) {
+                            pg.insert(name, ev.clone());
+                        }
+                    }
+                    pubq.drain(..);
+                    drop(pubq);
+                    drop(pg);
+                    return Ok(Flow::Normal);
                 }
-                r.map(|f| match f {
-                    Flow::Return(v) => Flow::Return(v),
-                    _ => Flow::Normal,
-                })
+                for (k, v) in pubq.drain(..) {
+                    pg.insert(k, v);
+                }
+                drop(pubq);
+                drop(pg);
+                match ret_flow.lock().unwrap().take() {
+                    Some(v) => Ok(Flow::Return(v)),
+                    None => Ok(Flow::Normal),
+                }
             }
             Stmt::Spawn(e) => {
-                // v1: run eagerly — channel semantics still work because the
-                // worker fills the queue before the consumer drains it.
-                if let Expr::Call { .. } = e {
-                    let _ = self.eval_call_spawn(e)?;
+                // Real §14 spawn: the task runs on its own OS thread from
+                // now on — the channel it holds is the sync point. The
+                // thread is registered and joined before the program exits:
+                // no orphans, ever.
+                if let Expr::Call { callee, args } = e {
+                    let mut vals = Vec::new();
+                    for a in args {
+                        vals.push(self.eval(a)?);
+                    }
+                    for v in &vals {
+                        self.escape_value(v);
+                    }
+                    let f = self
+                        .resolve_callee_func(callee)
+                        .ok_or_else(|| RuntimeError {
+                            msg: "spawn expects a callable function".into(),
+                            line: self.cur_line,
+                        })?;
+                    let mut child = self.fork_task(None);
+                    let func = match &f {
+                        Value::Func(fv) => fv.clone(),
+                        _ => return Ok(Flow::Normal),
+                    };
+                    let handle = std::thread::spawn(move || {
+                        if let Err(e) = child.call_func_value(&func, vals) {
+                            eprintln!("zap: spawned task failed: {} (at line {})", e.msg, e.line);
+                        }
+                    });
+                    SPAWNED_TASKS.lock().unwrap().push(handle);
+                    Ok(Flow::Normal)
                 } else {
                     self.eval(e)?;
+                    Ok(Flow::Normal)
                 }
-                Ok(Flow::Normal)
             }
             Stmt::Break => Ok(Flow::Break),
             Stmt::Continue => Ok(Flow::Continue),
@@ -1068,12 +1297,12 @@ impl Vm {
         match obj {
             Value::Ui(el) => {
                 // mutate an element's property and it updates (§16.1)
-                el.borrow_mut().set(field, val);
+                el.lock().unwrap().set(field, val);
                 Ok(())
             }
             Value::Record { fields, ty } => {
                 // ui element records stored as Record? (legacy) — allow growth
-                let mut f = fields.borrow_mut();
+                let mut f = fields.lock().unwrap();
                 if let Some((_, slot)) = f.iter_mut().find(|(n, _)| n == field) {
                     *slot = val;
                     Ok(())
@@ -1085,7 +1314,7 @@ impl Vm {
                 }
             }
             Value::Map(m) => {
-                let mut m = m.borrow_mut();
+                let mut m = m.lock().unwrap();
                 let key = Value::str(field);
                 if let Some((_, v)) = m.iter_mut().find(|(k, _)| values_equal(k, &key)) {
                     *v = val;
@@ -1117,21 +1346,21 @@ impl Vm {
                 for i in items {
                     vals.push(self.eval(i)?);
                 }
-                Ok(Value::Tuple(Rc::new(RefCell::new(vals))))
+                Ok(Value::Tuple(Arc::new(Mutex::new(vals))))
             }
             Expr::List(items) => {
                 let mut vals = Vec::new();
                 for i in items {
                     vals.push(self.eval(i)?);
                 }
-                Ok(Value::List(Rc::new(RefCell::new(vals))))
+                Ok(Value::List(Arc::new(Mutex::new(vals))))
             }
             Expr::Map(entries) => {
                 let mut vals = Vec::new();
                 for (k, v) in entries {
                     vals.push((self.eval(k)?, self.eval(v)?));
                 }
-                Ok(Value::Map(Rc::new(RefCell::new(vals))))
+                Ok(Value::Map(Arc::new(Mutex::new(vals))))
             }
             Expr::Call { callee, args } => self.eval_call(callee, args),
             Expr::Field { obj, name } => {
@@ -1202,15 +1431,15 @@ impl Vm {
                     // register the lambda as a fn capturing current scopes —
                     // captured bindings escape the checker's sight (§15.1)
                     self.escape_scopes();
-                    let id = self.fns.len();
-                    self.fns.push(FnDef {
+                    let id = self.prog.fns.read().unwrap().len();
+                    self.prog.fns.write().unwrap().push(Arc::new(FnDef {
                         name: "<lambda>".into(),
                         module: self.cur_module.clone(),
                         params: vec![("event".into(), None)],
                         body: body.clone(),
                         env: self.scopes.clone(),
-                    });
-                    vals.push(Value::Func(Rc::new(FuncVal {
+                    }));
+                    vals.push(Value::Func(Arc::new(FuncVal {
                         name: "<lambda>".into(),
                         params: vec!["event".into()],
                         param_types: vec![None],
@@ -1239,15 +1468,15 @@ impl Vm {
             return Ok(Value::Type(t));
         }
         // user function as a first-class value (route("/", Home), spawn f)
-        if let Some(ids) = self.fn_map.get(name) {
+        if let Some(ids) = self.prog.fn_map.get(name) {
             let id = ids
                 .iter()
                 .copied()
-                .find(|id| self.fns[*id].module == self.cur_module)
+                .find(|id| self.prog.fns.read().unwrap()[*id].module == self.cur_module)
                 .or_else(|| ids.first().copied())
                 .unwrap();
-            let f = &self.fns[id];
-            return Ok(Value::Func(Rc::new(FuncVal {
+            let f = self.prog.fns.read().unwrap()[id].clone();
+            return Ok(Value::Func(Arc::new(FuncVal {
                 name: name.to_string(),
                 params: f.params.iter().map(|(n, _)| n.clone()).collect(),
                 param_types: f
@@ -1263,7 +1492,7 @@ impl Vm {
         // builtins / ambient namespaces
         match name {
             "print" | "read" | "readInto" | "readDialogue" | "assert" | "typeof" | "len" | "str" | "int" | "float" | "env" | "clock" | "nav" | "ui" | "route" | "onClick" | "weak" | "channel" | "spawn" | "parallel" | "thisShell" | "math" | "json" | "exit" => {
-                return Ok(Value::Func(Rc::new(FuncVal {
+                return Ok(Value::Func(Arc::new(FuncVal {
                     name: name.to_string(),
                     params: vec![],
                     param_types: vec![],
@@ -1275,7 +1504,7 @@ impl Vm {
             _ => {}
         }
         if name == "zapYaml" {
-            return Ok(self.zap_yaml.clone());
+            return Ok(self.prog.zap_yaml.clone());
         }
         self.get(name).ok_or_else(|| RuntimeError {
             msg: format!("unknown name `{name}`"),
@@ -1312,10 +1541,10 @@ impl Vm {
                     .strip_prefix("__idx_")
                     .and_then(|s| s.parse::<usize>().ok())
                 {
-                    let f = fields.borrow();
+                    let f = fields.lock().unwrap();
                     return Ok(f.get(idx).map(|(_, v)| v.clone()).unwrap_or(Value::Nothing));
                 }
-                let f = fields.borrow();
+                let f = fields.lock().unwrap();
                 for (n, v) in f.iter() {
                     if n == name {
                         return Ok(v.clone());
@@ -1331,7 +1560,7 @@ impl Vm {
                     .strip_prefix("__idx_")
                     .and_then(|s| s.parse::<usize>().ok())
                 {
-                    let t = t.borrow();
+                    let t = t.lock().unwrap();
                     return Ok(t.get(idx).cloned().unwrap_or(Value::Nothing));
                 }
                 Err(RuntimeError {
@@ -1340,7 +1569,7 @@ impl Vm {
                 })
             }
             Value::List(l) => match name {
-                "len" => Ok(Value::Func(Rc::new(FuncVal {
+                "len" => Ok(Value::Func(Arc::new(FuncVal {
                     name: "List.len".into(),
                     params: vec![],
                     param_types: vec![],
@@ -1348,7 +1577,7 @@ impl Vm {
                     env: vec![],
                     builtin: Some(BuiltinFn::Len),
                 }))),
-                "push" => Ok(Value::Func(Rc::new(FuncVal {
+                "push" => Ok(Value::Func(Arc::new(FuncVal {
                     name: "List.push".into(),
                     params: vec!["v".into()],
                     param_types: vec![],
@@ -1364,11 +1593,11 @@ impl Vm {
             Value::Map(m) => {
                 // zapYaml.x and map.key read as field access (§19)
                 let key = Value::str(name);
-                if let Some((_, v)) = m.borrow().iter().find(|(k, _)| values_equal(k, &key)) {
+                if let Some((_, v)) = m.lock().unwrap().iter().find(|(k, _)| values_equal(k, &key)) {
                     return Ok(v.clone());
                 }
                 match name {
-                    "len" => Ok(Value::Func(Rc::new(FuncVal {
+                    "len" => Ok(Value::Func(Arc::new(FuncVal {
                         name: "Map.len".into(),
                         params: vec![],
                         param_types: vec![],
@@ -1383,13 +1612,13 @@ impl Vm {
                 }
             }
             Value::Str(s) => match name {
-                "len" => Ok(Value::Int(s.borrow().chars().count() as i128)),
+                "len" => Ok(Value::Int(s.lock().unwrap().chars().count() as i128)),
                 _ => Err(RuntimeError {
                     msg: format!("no field/method `{name}` on str"),
                     line: self.cur_line,
                 }),
             },
-            Value::Type(t) => Ok(Value::Func(Rc::new(FuncVal {
+            Value::Type(t) => Ok(Value::Func(Arc::new(FuncVal {
                 name: format!("type.{}", t.name()),
                 params: vec![],
                 param_types: vec![],
@@ -1402,13 +1631,13 @@ impl Vm {
                     // `win.add` — element factory; `.text(...)` etc. create children
                     return Ok(Value::Record {
                         ty: "ui.adder".into(),
-                        fields: Rc::new(RefCell::new(vec![(
+                        fields: Arc::new(Mutex::new(vec![(
                             "__parent".to_string(),
                             obj.clone(),
                         )])),
                     });
                 }
-                match el.borrow().get(name) {
+                match el.lock().unwrap().get(name) {
                     Some(v) => Ok(v),
                     None => Err(RuntimeError {
                         msg: format!("no property `{name}` on ui element"),
@@ -1419,7 +1648,7 @@ impl Vm {
             Value::Func(f) => {
                 // method-style: fnType is the big one (§8.1)
                 if name == "fnType" {
-                    return Ok(Value::Func(Rc::new(FuncVal {
+                    return Ok(Value::Func(Arc::new(FuncVal {
                         name: "fnType".into(),
                         params: vec!["T".into()],
                         param_types: vec![],
@@ -1514,7 +1743,7 @@ impl Vm {
                     }
                     _ => match (&lv, &rv) {
                         (Value::Str(a), Value::Str(b)) => {
-                            let (a, b) = (a.borrow().clone(), b.borrow().clone());
+                            let (a, b) = (a.lock().unwrap().clone(), b.lock().unwrap().clone());
                             let res = match op {
                                 BinOp::Lt => a < b,
                                 BinOp::Gt => a > b,
@@ -1543,13 +1772,13 @@ impl Vm {
     fn num_or_str_add(&mut self, l: &Value, r: &Value, _sub: bool) -> Result<Value, RuntimeError> {
         use crate::value::as_num;
         if let (Value::Str(a), Value::Str(b)) = (l, r) {
-            let mut s = a.borrow().clone();
-            s.push_str(&b.borrow());
+            let mut s = a.lock().unwrap().clone();
+            s.push_str(&b.lock().unwrap());
             return Ok(Value::str(s));
         }
         if let (Value::Str(a), b) = (l, r) {
             if !matches!(b, Value::Str(_)) {
-                let mut s = a.borrow().clone();
+                let mut s = a.lock().unwrap().clone();
                 s.push_str(&b.display());
                 return Ok(Value::str(s));
             }
@@ -1557,7 +1786,7 @@ impl Vm {
         if let (a, Value::Str(b)) = (l, r) {
             if !matches!(a, Value::Str(_)) {
                 let mut s = a.display();
-                s.push_str(&b.borrow());
+                s.push_str(&b.lock().unwrap());
                 return Ok(Value::str(s));
             }
         }
@@ -1769,7 +1998,7 @@ impl Vm {
                 // module namespace: `mod.fn(...)` — resolve before evaluating
                 // obj, since a pure namespace isn't a value.
                 if let Expr::Ident(modname) = obj.as_ref() {
-                    if self.modules.contains_key(modname) {
+                    if self.prog.modules.contains_key(modname) {
                         if let Some(v) = self.module_fn(modname, name) {
                             if let Value::Func(f) = v {
                                 return self.call_func_value(&f, args);
@@ -1804,7 +2033,7 @@ impl Vm {
     }
 
     fn call_user_fn(&mut self, name: &str, args: Vec<Value>) -> Result<Option<Value>, RuntimeError> {
-        let ids = match self.fn_map.get(name) {
+        let ids = match self.prog.fn_map.get(name) {
             Some(ids) => ids.clone(),
             None => return Ok(None),
         };
@@ -1812,14 +2041,14 @@ impl Vm {
         let id = ids
             .iter()
             .copied()
-            .find(|id| self.fns[*id].module == self.cur_module)
+            .find(|id| self.prog.fns.read().unwrap()[*id].module == self.cur_module)
             .or_else(|| ids.first().copied())
             .unwrap();
         Ok(Some(self.call_fn_id(id, args)?))
     }
 
     /// Re-enter a FuncVal from the native GUI bridge's click callback.
-    pub fn call_gui_func(&mut self, f: &Rc<FuncVal>, args: Vec<Value>) -> Result<Value, RuntimeError> {
+    pub fn call_gui_func(&mut self, f: &Arc<FuncVal>, args: Vec<Value>) -> Result<Value, RuntimeError> {
         self.call_func_value(f, args)
     }
 
@@ -1829,8 +2058,8 @@ impl Vm {
             return self.builtin_dispatch(&f.name, args);
         }
         let saved_module = self.cur_module.clone();
-        if f.body_id < self.fns.len() {
-            self.cur_module = self.fns[f.body_id].module.clone();
+        if f.body_id < self.prog.fns.read().unwrap().len() {
+            self.cur_module = self.prog.fns.read().unwrap()[f.body_id].module.clone();
         }
         // closure: env captured in FuncVal
         let saved = std::mem::replace(&mut self.scopes, f.env.clone());
@@ -1856,13 +2085,13 @@ impl Vm {
             "args",
             Value::Record {
                 ty: "args".into(),
-                fields: Rc::new(RefCell::new(vec![
+                fields: Arc::new(Mutex::new(vec![
                     ("count".into(), Value::Int(args.len() as i128)),
-                    ("rest".into(), Value::List(Rc::new(RefCell::new(rest)))),
+                    ("rest".into(), Value::List(Arc::new(Mutex::new(rest)))),
                 ])),
             },
         );
-        let fdef = &self.fns[f.body_id];
+        let fdef = self.prog.fns.read().unwrap()[f.body_id].clone();
         let body = fdef.body.clone();
         let r = self.exec_block(&body).and_then(|fl| match fl {
             Flow::Return(v) => Ok(v),
@@ -1926,22 +2155,22 @@ impl Vm {
                     } else {
                         tname.clone()
                     },
-                    fields: Rc::new(RefCell::new(out)),
+                    fields: Arc::new(Mutex::new(out)),
                 })
             }
-            TypeRepr::List(_) => Ok(Value::List(Rc::new(RefCell::new(args)))),
+            TypeRepr::List(_) => Ok(Value::List(Arc::new(Mutex::new(args)))),
             TypeRepr::Map(_, _) => {
                 // Map(k,v){} literal style or pairs
                 let mut m = Vec::new();
                 for a in args {
                     if let Value::Tuple(t) = a {
-                        let t = t.borrow();
+                        let t = t.lock().unwrap();
                         if t.len() == 2 {
                             m.push((t[0].clone(), t[1].clone()));
                         }
                     }
                 }
-                Ok(Value::Map(Rc::new(RefCell::new(m))))
+                Ok(Value::Map(Arc::new(Mutex::new(m))))
             }
             _ => Err(RuntimeError {
                 msg: format!("cannot construct {}", t.name()),
@@ -1971,29 +2200,29 @@ impl Vm {
             (Value::List(l), "push") => {
                 if let Some(v) = args.first() {
                     self.escape_value(v);
-                    l.borrow_mut().push(v.clone());
+                    l.lock().unwrap().push(v.clone());
                 }
                 Ok(Value::Nothing)
             }
-            (Value::List(l), "len") => Ok(Value::Int(l.borrow().len() as i128)),
-            (Value::List(l), "pop") => Ok(l.borrow_mut().pop().unwrap_or(Value::Nothing)),
-            (Value::List(l), "first") => Ok(l.borrow().first().cloned().unwrap_or(Value::Nothing)),
-            (Value::List(l), "last") => Ok(l.borrow().last().cloned().unwrap_or(Value::Nothing)),
+            (Value::List(l), "len") => Ok(Value::Int(l.lock().unwrap().len() as i128)),
+            (Value::List(l), "pop") => Ok(l.lock().unwrap().pop().unwrap_or(Value::Nothing)),
+            (Value::List(l), "first") => Ok(l.lock().unwrap().first().cloned().unwrap_or(Value::Nothing)),
+            (Value::List(l), "last") => Ok(l.lock().unwrap().last().cloned().unwrap_or(Value::Nothing)),
             (Value::List(l), "at") => {
                 let i = args.first().map(|v| crate::value::as_num(v).map(|n| n.as_f64() as i64).unwrap_or(0)).unwrap_or(0);
-                Ok(l.borrow().get(i.max(0) as usize).cloned().unwrap_or(Value::Nothing))
+                Ok(l.lock().unwrap().get(i.max(0) as usize).cloned().unwrap_or(Value::Nothing))
             }
             (Value::List(l), "contains") => {
                 let needle = args.first().cloned().unwrap_or(Value::Nothing);
-                Ok(Value::Bool(l.borrow().iter().any(|v| values_equal(v, &needle))))
+                Ok(Value::Bool(l.lock().unwrap().iter().any(|v| values_equal(v, &needle))))
             }
             (Value::List(l), "join") => {
                 let sep = args.first().map(|v| v.display()).unwrap_or_default();
-                let parts: Vec<String> = l.borrow().iter().map(|v| v.display()).collect();
+                let parts: Vec<String> = l.lock().unwrap().iter().map(|v| v.display()).collect();
                 Ok(Value::str(parts.join(&sep)))
             }
             (Value::List(l), "reverse") => {
-                l.borrow_mut().reverse();
+                l.lock().unwrap().reverse();
                 Ok(Value::Nothing)
             }
             (Value::List(l), "map") | (Value::Tuple(l), "map") => {
@@ -2001,19 +2230,19 @@ impl Vm {
                     Some(Value::Func(f)) => f.clone(),
                     _ => return self.err("map expects a fn value".into()),
                 };
-                let src: Vec<Value> = l.borrow().clone();
+                let src: Vec<Value> = l.lock().unwrap().clone();
                 let mut out = Vec::with_capacity(src.len());
                 for item in src {
                     out.push(self.call_func_value(&f, vec![item])?);
                 }
-                Ok(Value::List(Rc::new(RefCell::new(out))))
+                Ok(Value::List(Arc::new(Mutex::new(out))))
             }
             (Value::List(l), "filter") | (Value::Tuple(l), "filter") => {
                 let f = match args.first() {
                     Some(Value::Func(f)) => f.clone(),
                     _ => return self.err("filter expects a fn value".into()),
                 };
-                let src: Vec<Value> = l.borrow().clone();
+                let src: Vec<Value> = l.lock().unwrap().clone();
                 let mut out = Vec::new();
                 for item in src {
                     let keep = self.call_func_value(&f, vec![item.clone()])?;
@@ -2021,12 +2250,12 @@ impl Vm {
                         out.push(item);
                     }
                 }
-                Ok(Value::List(Rc::new(RefCell::new(out))))
+                Ok(Value::List(Arc::new(Mutex::new(out))))
             }
-            (Value::Map(m), "len") => Ok(Value::Int(m.borrow().len() as i128)),
+            (Value::Map(m), "len") => Ok(Value::Int(m.lock().unwrap().len() as i128)),
             (Value::Map(m), "get") => {
                 let k = args.first().cloned().unwrap_or(Value::Nothing);
-                Ok(m.borrow().iter().find(|(mk, _)| values_equal(mk, &k)).map(|(_, v)| v.clone()).unwrap_or(Value::Nothing))
+                Ok(m.lock().unwrap().iter().find(|(mk, _)| values_equal(mk, &k)).map(|(_, v)| v.clone()).unwrap_or(Value::Nothing))
             }
             (Value::Map(m), "set") => {
                 if args.len() >= 2 {
@@ -2034,7 +2263,7 @@ impl Vm {
                     let v = args[1].clone();
                     self.escape_value(&k);
                     self.escape_value(&v);
-                    let mut mm = m.borrow_mut();
+                    let mut mm = m.lock().unwrap();
                     if let Some(e) = mm.iter_mut().find(|(mk, _)| values_equal(mk, &k)) {
                         e.1 = v;
                     } else {
@@ -2045,44 +2274,47 @@ impl Vm {
             }
             (Value::Map(m), "has") => {
                 let k = args.first().cloned().unwrap_or(Value::Nothing);
-                Ok(Value::Bool(m.borrow().iter().any(|(mk, _)| values_equal(mk, &k))))
+                Ok(Value::Bool(m.lock().unwrap().iter().any(|(mk, _)| values_equal(mk, &k))))
             }
             (Value::Map(m), "keys") => {
-                Ok(Value::List(Rc::new(RefCell::new(m.borrow().iter().map(|(k, _)| k.clone()).collect()))))
+                Ok(Value::List(Arc::new(Mutex::new(m.lock().unwrap().iter().map(|(k, _)| k.clone()).collect()))))
             }
             (Value::Map(m), "values") => {
-                Ok(Value::List(Rc::new(RefCell::new(m.borrow().iter().map(|(_, v)| v.clone()).collect()))))
+                Ok(Value::List(Arc::new(Mutex::new(m.lock().unwrap().iter().map(|(_, v)| v.clone()).collect()))))
             }
-            (Value::Str(s), "len") => Ok(Value::Int(s.borrow().chars().count() as i128)),
-            (Value::Record { fields, .. }, "len") => Ok(Value::Int(fields.borrow().len() as i128)),
-            (Value::Tuple(t), "len") => Ok(Value::Int(t.borrow().len() as i128)),
-            (Value::Str(s), "upper") => Ok(Value::str(s.borrow().to_uppercase())),
-            (Value::Str(s), "lower") => Ok(Value::str(s.borrow().to_lowercase())),
-            (Value::Str(s), "trim") => Ok(Value::str(s.borrow().trim().to_string())),
+            (Value::Str(s), "len") => Ok(Value::Int(s.lock().unwrap().chars().count() as i128)),
+            (Value::Record { fields, .. }, "len") => Ok(Value::Int(fields.lock().unwrap().len() as i128)),
+            (Value::Tuple(t), "len") => Ok(Value::Int(t.lock().unwrap().len() as i128)),
+            (Value::Str(s), "upper") => Ok(Value::str(s.lock().unwrap().to_uppercase())),
+            (Value::Str(s), "lower") => Ok(Value::str(s.lock().unwrap().to_lowercase())),
+            (Value::Str(s), "trim") => Ok(Value::str(s.lock().unwrap().trim().to_string())),
             (Value::Str(s), "contains") => {
                 let needle = args.first().map(|v| v.display()).unwrap_or_default();
-                Ok(Value::Bool(s.borrow().contains(&needle)))
+                Ok(Value::Bool(s.lock().unwrap().contains(&needle)))
             }
             (Value::Str(s), "split") => {
                 let sep = args.first().map(|v| v.display()).unwrap_or_else(|| ",".into());
-                let parts: Vec<Value> = s.borrow().split(&sep).map(|p| Value::str(p)).collect();
-                Ok(Value::List(Rc::new(RefCell::new(parts))))
+                let parts: Vec<Value> = s.lock().unwrap().split(&sep).map(|p| Value::str(p)).collect();
+                Ok(Value::List(Arc::new(Mutex::new(parts))))
             }
             (Value::Channel(ch), "send") => {
                 if let Some(v) = args.first() {
                     self.escape_value(v);
-                    ch.borrow_mut().queue.push_back(v.clone());
+                    ch.send(v.clone()).map_err(|m| RuntimeError {
+                        msg: m,
+                        line: self.cur_line,
+                    })?;
                 }
                 Ok(Value::Nothing)
             }
             (Value::Channel(ch), "close") => {
-                ch.borrow_mut().closed = true;
+                ch.close();
                 Ok(Value::Nothing)
             }
             (Value::Record { ty, fields }, kind) if ty == "ui.adder" => {
                 // `win.add` factory value — `.text(...)`, `.button(...)` create children
                 let parent = fields
-                    .borrow()
+                    .lock().unwrap()
                     .iter()
                     .find(|(n, _)| n == "__parent")
                     .map(|(_, v)| v.clone())
@@ -2096,8 +2328,7 @@ impl Vm {
                 Ok(crate::uiruntime::UiRuntime::add_element(&parent, kind, &args))
             }
             (Value::Channel(ch), "recv") => {
-                let mut ch = ch.borrow_mut();
-                Ok(ch.queue.pop_front().unwrap_or(Value::Nothing))
+                Ok(ch.recv().unwrap_or(Value::Nothing))
             }
             _ => Err(RuntimeError {
                 msg: format!(
@@ -2136,7 +2367,7 @@ impl Vm {
         let mut pos = Vec::new();
         let mut opts: Vec<(String, Value)> = Vec::new();
         let mut literal = false;
-        let a = &self.cli_args;
+        let a = &self.prog.cli_args;
         let mut i = 0;
         while i < a.len() {
             let t = &a[i];
@@ -2185,14 +2416,14 @@ impl Vm {
     }
 
     fn args_list(&self) -> Value {
-        Value::List(std::rc::Rc::new(std::cell::RefCell::new(
-            self.cli_args.iter().map(|s| Value::str(s.clone())).collect(),
+        Value::List(std::sync::Arc::new(std::sync::Mutex::new(
+            self.prog.cli_args.iter().map(|s| Value::str(s.clone())).collect(),
         )))
     }
 
     fn args_positional(&self) -> Value {
         let (pos, _) = self.parse_cli_args();
-        Value::List(std::rc::Rc::new(std::cell::RefCell::new(
+        Value::List(std::sync::Arc::new(std::sync::Mutex::new(
             pos.into_iter().map(Value::str).collect(),
         )))
     }
@@ -2202,7 +2433,7 @@ impl Vm {
         // start from defaults map entries, parsed opts overlay (last wins)
         let mut entries: Vec<(Value, Value)> = Vec::new();
         if let Some(Value::Map(m)) = defaults {
-            entries = m.borrow().clone();
+            entries = m.lock().unwrap().clone();
         }
         for (k, v) in opts {
             let kv = Value::str(k);
@@ -2212,7 +2443,7 @@ impl Vm {
                 entries.push((kv, v));
             }
         }
-        Value::Map(std::rc::Rc::new(std::cell::RefCell::new(entries)))
+        Value::Map(std::sync::Arc::new(std::sync::Mutex::new(entries)))
     }
 
     fn namespaced_builtin(
@@ -2286,7 +2517,7 @@ impl Vm {
                 for a in &args {
                     self.escape_value(a);
                 }
-                Ok(Some(self.ui.window(&args)))
+                Ok(Some(self.prog.ui.lock().unwrap().window(&args)))
             }
             "ui.run" => {
                 // ui.run drives the native renderer in-process through the
@@ -2298,10 +2529,11 @@ impl Vm {
                         Value::Ui(e) => Some(e.clone()),
                         _ => None,
                     })
-                    .or_else(|| self.ui.windows.first().cloned());
+                    .or_else(|| self.prog.ui.lock().unwrap().windows.first().cloned());
                 #[cfg(any(unix, windows, target_os = "wasi"))]
                 if let Some(w) = win {
                     let eff = self
+                        .prog
                         .project
                         .as_ref()
                         .map(|p| p.config.efficient_redraw)
@@ -2311,28 +2543,32 @@ impl Vm {
                 }
                 // headless fallback only reachable without a window or on
                 // targets with no native backend (tests)
-                let mut ui = std::mem::take(&mut self.ui);
-                for w in &ui.windows {
-                    let mut el = w.borrow_mut();
+                let mut ui = self.prog.ui.lock().unwrap();
+                let mut any_dirty = false;
+                for w in ui.windows.iter() {
+                    let mut el = w.lock().unwrap();
                     if el.dirty {
                         el.dirty = false;
-                        ui.frame += 1;
+                        any_dirty = true;
                     }
                 }
-                self.ui = ui;
+                if any_dirty {
+                    ui.frame += 1;
+                }
+                drop(ui);
                 Ok(Some(Value::Nothing))
             }
             "nav.go" => {
                 // headless run: record navigation
                 let url = args.first().map(|v| v.display()).unwrap_or_default();
-                self.ui.navigations.push(url);
+                self.prog.ui.lock().unwrap().navigations.push(url);
                 Ok(Some(Value::Nothing))
             }
             "thisShell.shellOut" => {
                 let cmd = args.first().map(|v| v.display()).unwrap_or_default();
                 match run_shell(&cmd) {
                     Ok(out) => Ok(Some(Value::str(out))),
-                    Err(e) => Ok(Some(Value::Err(Rc::new(ErrVal {
+                    Err(e) => Ok(Some(Value::Err(Arc::new(ErrVal {
                         msg: e,
                         origin: "thisShell.shellOut".into(),
                     })))),
@@ -2422,10 +2658,10 @@ impl Vm {
             }
             "typeof" => Ok(args.first().map(|v| Value::str(v.type_repr().name())).unwrap_or(Value::str("nothing"))),
             "len" => Ok(match args.first() {
-                Some(Value::Str(s)) => Value::Int(s.borrow().chars().count() as i128),
-                Some(Value::List(l)) => Value::Int(l.borrow().len() as i128),
-                Some(Value::Map(m)) => Value::Int(m.borrow().len() as i128),
-                Some(Value::Tuple(t)) => Value::Int(t.borrow().len() as i128),
+                Some(Value::Str(s)) => Value::Int(s.lock().unwrap().chars().count() as i128),
+                Some(Value::List(l)) => Value::Int(l.lock().unwrap().len() as i128),
+                Some(Value::Map(m)) => Value::Int(m.lock().unwrap().len() as i128),
+                Some(Value::Tuple(t)) => Value::Int(t.lock().unwrap().len() as i128),
                 Some(v) => Value::Int(v.display().len() as i128),
                 None => Value::Int(0),
             }),
@@ -2433,18 +2669,18 @@ impl Vm {
             "int" => Ok(match args.first() {
                 Some(Value::Int(i)) => Value::Int(*i),
                 Some(Value::Float(f)) => Value::Int(*f as i128),
-                Some(Value::Str(s)) => Value::Int(s.borrow().parse().unwrap_or(0)),
+                Some(Value::Str(s)) => Value::Int(s.lock().unwrap().parse().unwrap_or(0)),
                 _ => Value::Int(0),
             }),
             "float" => Ok(match args.first() {
                 Some(Value::Float(f)) => Value::Float(*f),
                 Some(Value::Int(i)) => Value::Float(*i as f64),
-                Some(Value::Str(s)) => Value::Float(s.borrow().parse().unwrap_or(0.0)),
+                Some(Value::Str(s)) => Value::Float(s.lock().unwrap().parse().unwrap_or(0.0)),
                 _ => Value::Float(0.0),
             }),
             "Err" => {
                 let msg = args.first().map(|v| v.display()).unwrap_or_else(|| "error".into());
-                Ok(Value::Err(Rc::new(ErrVal {
+                Ok(Value::Err(Arc::new(ErrVal {
                     msg,
                     origin: "Err".into(),
                 })))
@@ -2454,31 +2690,29 @@ impl Vm {
                     self.escape_value(v);
                 }
                 Ok(match args.first() {
-                    Some(v) => Value::Weak(Rc::new(RefCell::new(v.clone()))),
+                    Some(v) => Value::Weak(Arc::new(Mutex::new(v.clone()))),
                     None => Value::Nothing,
                 })
             }
             "channel" => {
-                // (tx, rx) share one queue — send on tx, receive on rx
-                let st = Rc::new(RefCell::new(ChannelState {
-                    queue: std::collections::VecDeque::new(),
-                    closed: false,
-                    cap: 0,
-                }));
-                Ok(Value::Tuple(Rc::new(RefCell::new(vec![
-                    Value::Channel(st.clone()),
-                    Value::Channel(st),
+                // (tx, rx) share one queue — send on tx, receive on rx.
+                // Real blocking MPMC channel (§14): send blocks on a full
+                // bounded queue, recv blocks until a value or close.
+                let ch = Arc::new(ChannelShared::new(0));
+                Ok(Value::Tuple(Arc::new(Mutex::new(vec![
+                    Value::Channel(ch.clone()),
+                    Value::Channel(ch),
                 ]))))
             }
             "ui.window" | "window" => {
                 for a in &args {
                     self.escape_value(a);
                 }
-                Ok(self.ui.window(&args))
+                Ok(self.prog.ui.lock().unwrap().window(&args))
             }
             "route" => {
                 let path = args.first().map(|v| v.display()).unwrap_or_default();
-                self.ui.routes.push(path);
+                self.prog.ui.lock().unwrap().routes.push(path);
                 Ok(Value::Nothing)
             }
             "onClick" => {
@@ -2503,11 +2737,11 @@ impl Vm {
                     None => None,
                 };
                 if let (Some(e), Some(f)) = (el, handler) {
-                    let mut b = e.borrow_mut();
+                    let mut b = e.lock().unwrap();
                     b.handlers.push(("click".to_string(), f));
                     b.dirty = true;
                 }
-                self.ui.last_handler = args.iter().find_map(|v| match v {
+                self.prog.ui.lock().unwrap().last_handler = args.iter().find_map(|v| match v {
                     Value::Func(f) => Some(f.clone()),
                     _ => None,
                 });
@@ -2583,7 +2817,7 @@ fn value_to_type(v: &Value) -> Option<TypeRepr> {
     match v {
         Value::Type(t) => Some(t.clone()),
         Value::Tuple(t) => {
-            let t = t.borrow();
+            let t = t.lock().unwrap();
             if t.len() == 2 {
                 if let (Some(inner), Value::Nothing) = (value_to_type(&t[0]), &t[1]) {
                     return Some(TypeRepr::Optional(Box::new(inner)));
@@ -2609,11 +2843,11 @@ fn default_for(t: &TypeRepr) -> Value {
         TypeRepr::Float => Value::Float(0.0),
         TypeRepr::Str => Value::str(""),
         TypeRepr::Bool => Value::Bool(false),
-        TypeRepr::List(_) => Value::List(Rc::new(RefCell::new(vec![]))),
-        TypeRepr::Map(_, _) => Value::Map(Rc::new(RefCell::new(vec![]))),
+        TypeRepr::List(_) => Value::List(Arc::new(Mutex::new(vec![]))),
+        TypeRepr::Map(_, _) => Value::Map(Arc::new(Mutex::new(vec![]))),
         TypeRepr::Record { name, fields } => Value::Record {
             ty: name.clone(),
-            fields: Rc::new(RefCell::new(
+            fields: Arc::new(Mutex::new(
                 fields
                     .iter()
                     .map(|(n, t)| (n.clone(), default_for(t)))
@@ -2782,7 +3016,7 @@ impl<'a> JsonP<'a> {
             if self.peek() == b']' { self.i += 1; break; }
             break;
         }
-        Value::List(Rc::new(RefCell::new(items)))
+        Value::List(Arc::new(Mutex::new(items)))
     }
     fn object(&mut self) -> Value {
         self.i += 1;
@@ -2800,20 +3034,20 @@ impl<'a> JsonP<'a> {
             if self.peek() == b'}' { self.i += 1; break; }
             break;
         }
-        Value::Map(Rc::new(RefCell::new(m)))
+        Value::Map(Arc::new(Mutex::new(m)))
     }
 }
 
 fn json_stringify(v: &Value) -> String {
     match v {
-        Value::Str(s) => format!("\"{}\"", s.borrow().replace('"', "\\\"")),
+        Value::Str(s) => format!("\"{}\"", s.lock().unwrap().replace('"', "\\\"")),
         Value::Int(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Nothing => "null".into(),
         Value::List(l) => {
             let inner = l
-                .borrow()
+                .lock().unwrap()
                 .iter()
                 .map(json_stringify)
                 .collect::<Vec<_>>()
@@ -2822,7 +3056,7 @@ fn json_stringify(v: &Value) -> String {
         }
         Value::Map(m) => {
             let inner = m
-                .borrow()
+                .lock().unwrap()
                 .iter()
                 .map(|(k, v)| format!("{}:{}", json_stringify(k), json_stringify(v)))
                 .collect::<Vec<_>>()
@@ -2831,7 +3065,7 @@ fn json_stringify(v: &Value) -> String {
         }
         Value::Record { fields, .. } => {
             let inner = fields
-                .borrow()
+                .lock().unwrap()
                 .iter()
                 .map(|(k, v)| format!("\"{k}\":{}", json_stringify(v)))
                 .collect::<Vec<_>>()

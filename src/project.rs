@@ -182,12 +182,12 @@ pub fn find_root(dir: &Path) -> Result<PathBuf, String> {
 /// Build a Vm from a loaded project: registers all modules, sets zapYaml.
 pub fn vm_for(p: &std::sync::Arc<Project>) -> Result<Vm, String> {
     let mut vm = Vm::new();
-    vm.project = Some(p.clone());
+    vm.set_project(Some(p.clone()));
     for (mname, _, prog) in &p.modules {
         vm.load_module(mname, prog)
             .map_err(|e| format!("load error in module `{mname}`: {}", e.msg))?;
     }
-    vm.zap_yaml = yval_to_value_map(&p.config.vals);
+    vm.set_zap_yaml(yval_to_value_map(&p.config.vals));
     Ok(vm)
 }
 
@@ -196,7 +196,7 @@ fn yval_to_value_map(m: &BTreeMap<String, crate::config::YVal>) -> Value {
         .iter()
         .map(|(k, v)| (Value::str(k.clone()), yval_to_value(v)))
         .collect();
-    Value::Map(std::rc::Rc::new(std::cell::RefCell::new(entries)))
+    Value::Map(std::sync::Arc::new(std::sync::Mutex::new(entries)))
 }
 
 fn yval_to_value(v: &crate::config::YVal) -> Value {
@@ -207,7 +207,7 @@ fn yval_to_value(v: &crate::config::YVal) -> Value {
         Float(f) => Value::Float(*f),
         Bool(b) => Value::Bool(*b),
         Null => Value::Nothing,
-        Seq(items) => Value::List(std::rc::Rc::new(std::cell::RefCell::new(
+        Seq(items) => Value::List(std::sync::Arc::new(std::sync::Mutex::new(
             items.iter().map(yval_to_value).collect(),
         ))),
         Map(m) => {
@@ -215,7 +215,7 @@ fn yval_to_value(v: &crate::config::YVal) -> Value {
                 .iter()
                 .map(|(k, v)| (Value::str(k.clone()), yval_to_value(v)))
                 .collect();
-            Value::Map(std::rc::Rc::new(std::cell::RefCell::new(entries)))
+            Value::Map(std::sync::Arc::new(std::sync::Mutex::new(entries)))
         }
     }
 }

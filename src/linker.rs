@@ -2,18 +2,15 @@
 //!
 //! Artifact layout: `<payload><"ZAPR"><pubkey:32><sig:64>` — the trailer
 //! keeps native executables directly runnable (ELF ignores trailing data).
-//! Signing uses the system OpenSSL CLI; `zap verify` checks magic +
-//! signature before you run something you downloaded.
+//! Signing is pure Rust (ed25519-dalek); `zap verify` checks magic +
+//! signature before you run something you downloaded. No external tools.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 const TRAILER_LEN: usize = 4 + 32 + 64;
 const MAGIC: &[u8; 4] = b"ZAPR";
-/// Ed25519 SubjectPublicKeyInfo DER prefix; raw pubkey appends after it.
-const ED25519_SPKI_PREFIX: [u8; 12] = [
-    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-];
 
 /// `zap verify <artifact>` — check the Ed25519 signature.
 pub fn verify(artifact: &Path) -> Result<(), String> {
@@ -32,44 +29,14 @@ fn check_magic_and_signature(data: &[u8]) -> Result<(), String> {
         return Err("not a Zappr artifact (bad magic)".into());
     }
     let payload = &data[..data.len() - TRAILER_LEN];
-    let pk_raw = &t[4..36];
-    let sig = &t[36..100];
+    let pk_raw: &[u8; 32] = t[4..36].try_into().unwrap();
+    let sig: &[u8; 64] = t[36..100].try_into().unwrap();
 
-    // raw pubkey → SPKI DER for openssl
-    let mut spki = Vec::with_capacity(44);
-    spki.extend_from_slice(&ED25519_SPKI_PREFIX);
-    spki.extend_from_slice(pk_raw);
-    let dir = scratch_dir();
-    let tag = format!("zapverify-{}", std::process::id());
-    let key = dir.join(format!("{tag}.der"));
-    let msg = dir.join(format!("{tag}.msg"));
-    let sf = dir.join(format!("{tag}.sig"));
-    std::fs::write(&key, &spki).map_err(|e| e.to_string())?;
-    std::fs::write(&msg, payload).map_err(|e| e.to_string())?;
-    std::fs::write(&sf, sig).map_err(|e| e.to_string())?;
-    let out = Command::new("openssl")
-        .args(["pkeyutl", "-verify", "-pubin", "-keyform", "DER", "-inkey"])
-        .arg(&key)
-        .args(["-rawin", "-in"])
-        .arg(&msg)
-        .args(["-sigfile"])
-        .arg(&sf)
-        .output();
-    let _ = std::fs::remove_file(&key);
-    let _ = std::fs::remove_file(&msg);
-    let _ = std::fs::remove_file(&sf);
-    match out {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => Err(format!(
-            "signature verification FAILED{}",
-            String::from_utf8_lossy(&o.stderr)
-                .lines()
-                .next()
-                .map(|l| format!(": {l}"))
-                .unwrap_or_default()
-        )),
-        Err(e) => Err(format!("cannot run openssl: {e}")),
-    }
+    let vk = VerifyingKey::from_bytes(pk_raw)
+        .map_err(|e| format!("bad public key: {e}"))?;
+    let sig = Signature::from_bytes(sig);
+    vk.verify(payload, &sig)
+        .map_err(|_| "signature verification FAILED".to_string())
 }
 
 /// Sign `payload`, returning payload+trailer. `key` overrides the
@@ -86,48 +53,17 @@ pub fn sign(payload: &[u8], key: Option<&Path>) -> Result<Vec<u8>, String> {
         }
         None => ensure_key()?,
     };
-    let pk_raw = pubkey_raw(&key)?;
-
-    let dir = scratch_dir();
-    let tag = format!("zapsign-{}", std::process::id());
-    let msg = dir.join(format!("{tag}.msg"));
-    let sig = dir.join(format!("{tag}.sig"));
-    std::fs::write(&msg, payload).map_err(|e| e.to_string())?;
-    let out = Command::new("openssl")
-        .args(["pkeyutl", "-sign", "-inkey", key.to_str().unwrap_or("signing.key"), "-rawin", "-in"])
-        .arg(&msg)
-        .args(["-out"])
-        .arg(&sig)
-        .output()
-        .map_err(|e| format!("cannot run openssl: {e}"))?;
-    let _ = std::fs::remove_file(&msg);
-    if !out.status.success() {
-        let _ = std::fs::remove_file(&sig);
-        return Err(format!(
-            "openssl sign failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    let sig_bytes = std::fs::read(&sig).map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(&sig);
-    if sig_bytes.len() != 64 {
-        return Err(format!("unexpected signature length {}", sig_bytes.len()));
-    }
+    let seed = seed_from_key(&key)?;
+    let sk = SigningKey::from_bytes(&seed);
+    let sig: [u8; 64] = sk.sign(payload).to_bytes();
+    let pk_raw = sk.verifying_key().to_bytes();
 
     let mut out_b = Vec::with_capacity(payload.len() + TRAILER_LEN);
     out_b.extend_from_slice(payload);
     out_b.extend_from_slice(MAGIC);
     out_b.extend_from_slice(&pk_raw);
-    out_b.extend_from_slice(&sig_bytes);
+    out_b.extend_from_slice(&sig);
     Ok(out_b)
-}
-
-fn scratch_dir() -> PathBuf {
-    let base = std::env::var("XDG_CACHE_HOME").map(PathBuf::from).ok()
-        .or_else(|| std::env::var("HOME").map(|h| PathBuf::from(h).join(".cache")).ok());
-    let d = base.unwrap_or_else(std::env::temp_dir).join("zap").join("build");
-    let _ = std::fs::create_dir_all(&d);
-    d
 }
 
 fn key_path() -> PathBuf {
@@ -146,40 +82,66 @@ fn ensure_key() -> Result<PathBuf, String> {
     if let Err(e) = std::fs::create_dir_all(parent) {
         return Err(format!("cannot create {}: {e}", parent.display()));
     }
-    let out = Command::new("openssl")
-        .args(["genpkey", "-algorithm", "ED25519", "-out"])
-        .arg(&path)
-        .output()
-        .map_err(|e| format!("cannot run openssl: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "openssl genpkey failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed)
+        .map_err(|e| format!("cannot generate signing key: {e}"))?;
+    std::fs::write(&path, seed).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     eprintln!("zap: generated signing key at {}", path.display());
     Ok(path)
 }
 
-/// Extract the raw 32-byte public key from an Ed25519 PEM private key.
-fn pubkey_raw(key: &Path) -> Result<[u8; 32], String> {
-    let out = Command::new("openssl")
-        .args(["pkey", "-in"])
-        .arg(key)
-        .args(["-pubout", "-outform", "DER"])
-        .output()
-        .map_err(|e| format!("cannot run openssl: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "openssl pkey failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+/// Extract the 32-byte Ed25519 seed from a key file. Accepts:
+/// - raw 32-byte seed files (what `ensure_key` writes)
+/// - 64-byte seed||pub concatenations (first 32 bytes)
+/// - PEM PKCS8 (openssl `genpkey -algorithm ED25519`) — base64 body is
+///   DER whose last 32 bytes are the seed
+/// - raw PKCS8 DER — same last-32-bytes rule
+fn seed_from_key(key: &Path) -> Result<[u8; 32], String> {
+    let data = std::fs::read(key).map_err(|e| format!("cannot read {}: {e}", key.display()))?;
+    let der = if data.starts_with(b"-----") {
+        let text = String::from_utf8_lossy(&data);
+        let body: String = text
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect();
+        b64decode(&body).ok_or("malformed PEM key")?
+    } else {
+        data
+    };
+    let seed_src: &[u8] = match der.len() {
+        32 => &der,
+        64 => &der[..32],
+        n if n > 32 => &der[n - 32..],
+        _ => return Err(format!("{}: key too short ({} bytes)", key.display(), der.len())),
+    };
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(seed_src);
+    Ok(seed)
+}
+
+/// Standard-alphabet base64 decode; whitespace is skipped.
+fn b64decode(s: &str) -> Option<Vec<u8>> {
+    let mut tbl = [255u8; 256];
+    for (i, c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".iter().enumerate() {
+        tbl[*c as usize] = i as u8;
     }
-    let der = out.stdout;
-    if der.len() < 44 {
-        return Err("unexpected public key DER length".into());
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut nbits = 0;
+    for &b in s.as_bytes() {
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        let v = tbl[b as usize];
+        if v == 255 {
+            return None;
+        }
+        acc = (acc << 6) | v as u32;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((acc >> nbits) as u8);
+        }
     }
-    let mut pk = [0u8; 32];
-    pk.copy_from_slice(&der[der.len() - 32..]);
-    Ok(pk)
+    Some(out)
 }

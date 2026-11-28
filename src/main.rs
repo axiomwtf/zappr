@@ -62,6 +62,9 @@ fn dispatch(cmd: &str, rest: &[String]) -> Result<(), String> {
         "fmt" => cmd_fmt(rest),
         "verify" => cmd_verify(rest),
         "copyright" => cmd_copyright(rest),
+        "__hostblob" => codegen::make_host_blob(
+            rest.first().map(String::as_str).unwrap_or(""),
+        ).map(|_| ()),
         other => cmd_custom(other, rest),
     }
 }
@@ -106,7 +109,7 @@ fn cmd_custom(cmd: &str, rest: &[String]) -> Result<(), String> {
         );
         vm.load_module(&modname, &prog)
             .map_err(|e| format!("cli module `{modname}`: {}", e.msg))?;
-        vm.cli_args = rest.to_vec();
+        vm.set_cli_args(rest.to_vec());
         return match vm.call_named(cmd, Vec::new()) {
             Ok(_) => Ok(()),
             Err(e) => Err(format!("`{cmd}` failed: {}", e.msg)),
@@ -119,7 +122,7 @@ fn cmd_custom(cmd: &str, rest: &[String]) -> Result<(), String> {
 fn run_embedded(root: &Path, cli_args: &[String]) -> Result<(), String> {
     let p = std::sync::Arc::new(project::load(root, false)?);
     let mut vm = project::vm_for(&p)?;
-    vm.cli_args = cli_args.to_vec();
+    vm.set_cli_args(cli_args.to_vec());
     #[cfg(target_os = "wasi")]
     {
         // on web, ui.run returns after attaching the GUI tree and the
@@ -157,7 +160,7 @@ fn cmd_run(rest: &[String]) -> Result<(), String> {
     } else {
         rest.to_vec()
     };
-    vm.cli_args = args;
+    vm.set_cli_args(args);
     match vm.run_main() {
         Ok(_) => Ok(()),
         Err(e) => Err(format!("runtime error: {}", e.msg)),
@@ -179,7 +182,9 @@ fn cmd_build(rest: &[String]) -> Result<(), String> {
                 .cloned()
         })
         .or_else(|| p.config.targets.first().cloned())
-        .unwrap_or_else(|| "linux".into());
+        .unwrap_or_else(|| {
+            if cfg!(windows) { "windows".into() } else { "linux".into() }
+        });
     codegen::build(&p, &mut project::vm_for(&p)?, &target, release)
 }
 

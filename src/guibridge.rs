@@ -3,15 +3,16 @@
 //! no compiled artifact, no C runtime (§16).
 //!
 //! The renderer speaks the ZUiC/ZValC C ABI; we build that tree here
-//! from `Rc<RefCell<UiElement>>` and marshal click handlers back into
+//! from `Arc<Mutex<UiElement>>` and marshal click handlers back into
 //! `Vm::call_func_value` through a side table.
 
 use crate::interp::Vm;
 use crate::uiruntime::UiElement;
 use crate::value::{FuncVal, Value};
 use std::cell::RefCell;
+use std::sync::Mutex;
 use std::ffi::CString;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use zapgui::{
     ZInvokeCb, ZPairC, ZRefreshCb, ZUiC, ZValC, ZValU, ZVecC, Z_BOOL, Z_BYTES,
@@ -25,14 +26,14 @@ use zapgui::zap_gui_run;
 static mut HOST_VM: *mut Vm = std::ptr::null_mut();
 thread_local! {
     /// The live UiElement window being rendered; refresh re-marshals it.
-    static HOST_EL: RefCell<Option<Rc<RefCell<UiElement>>>> = const { RefCell::new(None) };
+    static HOST_EL: RefCell<Option<Arc<Mutex<UiElement>>>> = const { RefCell::new(None) };
 }
 /// Most recently handed-out ZUiC tree — freed on the next refresh.
 static mut LAST_TREE: *mut ZUiC = std::ptr::null_mut();
 
 /// Click-handler payload stored behind a Z_FUNC's opaque fn pointer.
 struct HostFn {
-    f: Rc<FuncVal>,
+    f: Arc<FuncVal>,
 }
 
 fn cstr(s: &str) -> *mut std::os::raw::c_char {
@@ -57,7 +58,7 @@ fn val_to_zvalc(v: &Value) -> ZValC {
         }
         Value::Str(s) => {
             z.tag = Z_STR;
-            z.u.s = cstr(&s.borrow());
+            z.u.s = cstr(&s.lock().unwrap());
         }
         Value::Bool(b) => {
             z.tag = Z_BOOL;
@@ -69,7 +70,7 @@ fn val_to_zvalc(v: &Value) -> ZValC {
         }
         Value::List(l) => {
             z.tag = Z_LIST;
-            let items: Vec<ZValC> = l.borrow().iter().map(val_to_zvalc).collect();
+            let items: Vec<ZValC> = l.lock().unwrap().iter().map(val_to_zvalc).collect();
             let n = items.len();
             let ptr = if n > 0 {
                 let mut b = items.into_boxed_slice();
@@ -102,8 +103,8 @@ fn prop_to_pair(name: &str, v: &Value) -> ZPairC {
     }
 }
 
-fn el_to_zui(el: &Rc<RefCell<UiElement>>) -> *mut ZUiC {
-    let e = el.borrow();
+fn el_to_zui(el: &Arc<Mutex<UiElement>>) -> *mut ZUiC {
+    let e = el.lock().unwrap();
     let props: Vec<ZPairC> = e.props.iter().map(|(n, v)| prop_to_pair(n, v)).collect();
     let pn = props.len();
     let props_ptr = if pn > 0 {
@@ -235,14 +236,14 @@ unsafe fn free_zui(u: *mut ZUiC) {
     }
 }
 
-fn subtree_dirty(el: &Rc<RefCell<UiElement>>) -> bool {
-    let e = el.borrow();
+fn subtree_dirty(el: &Arc<Mutex<UiElement>>) -> bool {
+    let e = el.lock().unwrap();
     e.dirty || e.children.iter().any(subtree_dirty)
 }
 
-fn clear_subtree(el: &Rc<RefCell<UiElement>>) {
+fn clear_subtree(el: &Arc<Mutex<UiElement>>) {
     let kids = {
-        let mut e = el.borrow_mut();
+        let mut e = el.lock().unwrap();
         e.dirty = false;
         e.children.clone()
     };
@@ -290,7 +291,7 @@ unsafe extern "C" fn host_invoke(fv: *const ZValC) {
 /// `vm` is the live interpreter — passed as a raw pointer because the
 /// renderer re-enters it from click handlers while `ui.run` is on the
 /// stack (single-threaded; the outer borrow is suspended, not aliased).
-pub fn run(win: &Rc<RefCell<UiElement>>, vm: *mut Vm, efficient: bool) -> i32 {
+pub fn run(win: &Arc<Mutex<UiElement>>, vm: *mut Vm, efficient: bool) -> i32 {
     unsafe {
         HOST_VM = vm;
         HOST_EL.with(|c| *c.borrow_mut() = Some(win.clone()));

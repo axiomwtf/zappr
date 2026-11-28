@@ -138,36 +138,117 @@ fn rust_toolchain() -> (PathBuf, PathBuf) {
     }
 }
 
-/// The zap host binary that becomes the artifact.
-/// Linux reuses the running zap binary; windows cross-compiles a
-/// windows-gnu host into the artifact cache (keyed by source hash).
-fn host_exe(target: &str) -> Result<PathBuf, String> {
+/// Fingerprint of the sources this binary was compiled from, baked in
+/// by build.rs so it stays valid when the zap binary is installed or
+/// copied away from the source tree. Host blobs under src/hosts/ are
+/// excluded from the hash (they are outputs, and hashing them would
+/// make regeneration unstable).
+fn src_fingerprint() -> u64 {
+    env!("ZAP_SRC_FP").parse().unwrap_or(0)
+}
+
+/* ---------- prebuilt host blobs (zero-toolchain builds) ---------- */
+//
+// `zap build` never needs a cross toolchain: the wasm and windows
+// hosts ship inside the zap binary as stamped blobs under src/hosts/.
+// A blob is `<host bytes> + u64 src_fingerprint + "ZAH1"`; when the
+// fingerprint matches the running sources it is used verbatim,
+// otherwise codegen falls back to a real cross-compile (which needs
+// rustup target stds + llvm-mingw for windows). Regenerate blobs with
+// `zap __hostblob <target>` on a machine that has the toolchains.
+
+const BLOB_MAGIC: &[u8; 4] = b"ZAH1";
+const HOST_LINUX_BLOB: &[u8] = include_bytes!("hosts/linux-x86_64");
+const HOST_WIN_BLOB: &[u8] = include_bytes!("hosts/windows-gnu.exe");
+const HOST_WASM_BLOB: &[u8] = include_bytes!("hosts/wasm32-wasip1.wasm");
+
+/// Extract host bytes from a stamped blob when its fingerprint
+/// matches the current sources.
+fn stamped_blob(blob: &[u8]) -> Option<Vec<u8>> {
+    let n = blob.len();
+    if n < 12 || &blob[n - 4..] != BLOB_MAGIC {
+        return None;
+    }
+    let h = u64::from_le_bytes(blob[n - 12..n - 4].try_into().ok()?);
+    if h != src_fingerprint() {
+        return None;
+    }
+    Some(blob[..n - 12].to_vec())
+}
+
+/// The zap host binary bytes for a native (non-web) target.
+/// Cross-compiling uses the stamped blob for the foreign target;
+/// building for the host OS reuses the running binary itself.
+fn host_bytes(target: &str) -> Result<Vec<u8>, String> {
+    let current_exe = |what: &str| -> Result<Vec<u8>, String> {
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("cannot locate zap binary: {e}"))?;
+        std::fs::read(&exe).map_err(|e| format!("cannot read {}: {e}", exe.display()))
+            .map_err(|e| format!("{what}: {e}"))
+    };
     match target {
-        "linux" | "linux-x86_64" => std::env::current_exe()
-            .map_err(|e| format!("cannot locate zap binary: {e}")),
-        "windows" | "windows-x86_64" => host_exe_win(),
+        "linux" | "linux-x86_64" => {
+            if cfg!(target_os = "linux") {
+                current_exe("linux host")
+            } else if let Some(b) = stamped_blob(HOST_LINUX_BLOB) {
+                Ok(b)
+            } else {
+                Err("no linux host blob: build zap on linux and run \
+                     `zap __hostblob linux`, then commit src/hosts/linux-x86_64"
+                    .into())
+            }
+        }
+        "windows" | "windows-x86_64" => {
+            if cfg!(windows) {
+                current_exe("windows host")
+            } else if let Some(b) = stamped_blob(HOST_WIN_BLOB) {
+                Ok(b)
+            } else {
+                let p = host_exe_win()?;
+                std::fs::read(&p).map_err(|e| format!("cannot read {}: {e}", p.display()))
+            }
+        }
         _ => Err(format!("no host binary for target {target}")),
     }
+}
+
+/// Cross-compile a host for `target` and write a stamped blob into
+/// src/hosts/. Maintainer command: `zap __hostblob windows|web`.
+pub fn make_host_blob(target: &str) -> Result<PathBuf, String> {
+    let (bytes, name) = match target {
+        "linux" | "linux-x86_64" => {
+            let exe = std::env::current_exe()
+                .map_err(|e| format!("cannot locate zap binary: {e}"))?;
+            (std::fs::read(&exe).map_err(|e| format!("cannot read {}: {e}", exe.display()))?,
+             "linux-x86_64")
+        }
+        "windows" | "windows-x86_64" => {
+            let p = host_exe_win()?;
+            (std::fs::read(&p).map_err(|e| format!("cannot read {}: {e}", p.display()))?,
+             "windows-gnu.exe")
+        }
+        "web" | "wasm" | "wasm32" => {
+            let p = wasm_host_exe()?;
+            (std::fs::read(&p).map_err(|e| format!("cannot read {}: {e}", p.display()))?,
+             "wasm32-wasip1.wasm")
+        }
+        _ => return Err(format!("no host blob for target {target}")),
+    };
+    let mut out = bytes;
+    out.extend_from_slice(&src_fingerprint().to_le_bytes());
+    out.extend_from_slice(BLOB_MAGIC);
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/hosts");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(name);
+    std::fs::write(&path, &out).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    println!("wrote {} ({} bytes)", path.display(), out.len());
+    Ok(path)
 }
 
 /// Cross-compile the zap host for windows-gnu once per source hash.
 fn host_exe_win() -> Result<PathBuf, String> {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut h = DefaultHasher::new();
-    if let Ok(rd) = std::fs::read_dir(manifest.join("src")) {
-        let mut files: Vec<PathBuf> = rd
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|f| f.extension().map(|e| e == "rs").unwrap_or(false))
-            .collect();
-        files.sort();
-        for f in files {
-            if let Ok(b) = std::fs::read(&f) { b.hash(&mut h); }
-        }
-    }
-    if let Ok(b) = std::fs::read(manifest.join("Cargo.toml")) { b.hash(&mut h); }
-    if let Ok(b) = std::fs::read(manifest.join("src/webshim.js")) { b.hash(&mut h); }
-    let key = h.finish();
+    let key = src_fingerprint();
     let out = artifact_cache_dir().join(format!("zap-host-win-{key:016x}.exe"));
     if out.exists() { return Ok(out); }
 
@@ -221,9 +302,7 @@ fn build_inner(p: &Project, _vm: &mut Vm, target: &str, _release: bool, out: &Pa
     }
 
     // artifact = host binary + appended project archive
-    let host = host_exe(target)?;
-    let mut bytes = std::fs::read(&host)
-        .map_err(|e| format!("cannot read host {}: {e}", host.display()))?;
+    let mut bytes = host_bytes(target)?;
     let section = pack::pack_section(p)?;
     bytes.extend_from_slice(&section);
 
@@ -440,15 +519,19 @@ fn u32leb(n: u32) -> Vec<u8> {
     out
 }
 
-/// Web target (§18.1): the zap host compiled to wasm32-wasip1, with the
-/// packed project archive embedded as a `zappr` custom section (legal
-/// anywhere in a wasm module, ignored by engines). Emits `<name>.wasm`
-/// plus `<name>.html`, a self-contained loader carrying a minimal WASI
-/// preview1 shim over an in-memory filesystem.
-fn build_web(p: &Project, out: &Path) -> Result<(), String> {
+/// Cross-compile the zap host for wasm32-wasip1 once per source hash.
+/// Only reached when the stamped blob is missing or stale.
+fn wasm_host_exe() -> Result<PathBuf, String> {
+    let key = src_fingerprint();
+    let tdir = artifact_cache_dir().join("zap-wasm-target");
+    let out = tdir
+        .join("wasm32-wasip1")
+        .join("release")
+        .join(format!("zap-{key:016x}.wasm"));
+    if out.exists() { return Ok(out); }
+
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let (cargo, rustc) = rust_toolchain();
-    let tdir = artifact_cache_dir().join("zap-wasm-target");
     let o = Command::new(&cargo)
         .args(["build", "--release", "--bin", "zap", "--target",
                "wasm32-wasip1", "--target-dir"])
@@ -465,12 +548,29 @@ fn build_web(p: &Project, out: &Path) -> Result<(), String> {
             String::from_utf8_lossy(&o.stderr)
         ));
     }
-    let wasm_path = tdir
+    let built = tdir
         .join("wasm32-wasip1")
         .join("release")
         .join("zap.wasm");
-    let wasm = std::fs::read(&wasm_path)
-        .map_err(|e| format!("cannot read {}: {e}", wasm_path.display()))?;
+    std::fs::copy(&built, &out).map_err(|e| format!("cannot stage wasm host: {e}"))?;
+    Ok(out)
+}
+
+/// Web target (§18.1): the zap host compiled to wasm32-wasip1, with the
+/// packed project archive embedded as a `zappr` custom section (legal
+/// anywhere in a wasm module, ignored by engines). Emits `<name>.wasm`
+/// plus `<name>.html`, a self-contained loader carrying a minimal WASI
+/// preview1 shim over an in-memory filesystem.
+fn build_web(p: &Project, out: &Path) -> Result<(), String> {
+    // prefer the stamped prebuilt host blob; cross-compile only when
+    // it is missing or stale relative to the current sources.
+    let wasm = match stamped_blob(HOST_WASM_BLOB) {
+        Some(b) => b,
+        None => {
+            let p = wasm_host_exe()?;
+            std::fs::read(&p).map_err(|e| format!("cannot read {}: {e}", p.display()))?
+        }
+    };
 
     // embed the project archive as a `zappr` custom section right after
     // the 8-byte wasm header; valid position for custom sections.
