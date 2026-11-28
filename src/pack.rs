@@ -169,6 +169,7 @@ pub fn extract_dir(archive: &[u8]) -> PathBuf {
 
 /// Read this executable's tail looking for an embedded project.
 /// Returns the extracted project root when running as an artifact.
+#[cfg(not(target_os = "wasi"))]
 pub fn embedded_project_root() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let data = std::fs::read(&exe).ok()?;
@@ -183,5 +184,19 @@ pub fn embedded_project_root() -> Option<PathBuf> {
         extract(&archive, &dir).ok()?;
         std::fs::write(&marker, b"").ok()?;
     }
+    Some(dir)
+}
+
+/// On wasi there is no readable exe and no real filesystem: the web
+/// loader stashes the packed project archive at `/.zap-archive` inside
+/// the WASI filesystem before `_start`, and we extract it to
+/// `/.zap-host`.
+#[cfg(target_os = "wasi")]
+pub fn embedded_project_root() -> Option<PathBuf> {
+    let data = std::fs::read("/.zap-archive").ok()?;
+    let dir = PathBuf::from("/.zap-host");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).ok()?;
+    extract(&data, &dir).ok()?;
     Some(dir)
 }

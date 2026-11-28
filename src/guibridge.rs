@@ -14,9 +14,11 @@ use std::ffi::CString;
 use std::rc::Rc;
 
 use zapgui::{
-    zap_gui_run, ZInvokeCb, ZPairC, ZRefreshCb, ZUiC, ZValC, ZValU, ZVecC, Z_BOOL, Z_BYTES,
+    ZInvokeCb, ZPairC, ZRefreshCb, ZUiC, ZValC, ZValU, ZVecC, Z_BOOL, Z_BYTES,
     Z_FLOAT, Z_FUNC, Z_INT, Z_LIST, Z_NOTHING, Z_STR,
 };
+#[cfg(not(target_os = "wasi"))]
+use zapgui::zap_gui_run;
 
 /// The Vm currently inside `ui.run` — set for the duration of the
 /// native event loop so click handlers can re-enter the interpreter.
@@ -295,11 +297,23 @@ pub fn run(win: &Rc<RefCell<UiElement>>, vm: *mut Vm, efficient: bool) -> i32 {
         LAST_TREE = el_to_zui(win);
         let cb: ZInvokeCb = Some(host_invoke);
         let rcb: ZRefreshCb = Some(host_refresh);
-        let r = zap_gui_run(LAST_TREE, cb, rcb, efficient as i32);
-        free_zui(LAST_TREE);
-        LAST_TREE = std::ptr::null_mut();
-        HOST_EL.with(|c| *c.borrow_mut() = None);
-        HOST_VM = std::ptr::null_mut();
-        r
+        #[cfg(target_os = "wasi")]
+        {
+            // wasm can't block: attach the tree and let the JS shim
+            // drive zap_gui_feed/zap_gui_step from the browser event
+            // loop. The marshalled tree and HOST_VM stay alive for the
+            // life of the page, intentionally not freed.
+            let _ = zapgui::zap_gui_attach(LAST_TREE, cb, rcb, 800, 600, efficient as i32);
+            return 1;
+        }
+        #[cfg(not(target_os = "wasi"))]
+        {
+            let r = zap_gui_run(LAST_TREE, cb, rcb, efficient as i32);
+            free_zui(LAST_TREE);
+            LAST_TREE = std::ptr::null_mut();
+            HOST_EL.with(|c| *c.borrow_mut() = None);
+            HOST_VM = std::ptr::null_mut();
+            return r;
+        }
     }
 }

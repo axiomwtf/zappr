@@ -468,12 +468,17 @@ impl DirtyClear for ZUiC {
 
 #[cfg(unix)]
 mod wayland;
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
 mod win32;
+#[cfg(target_os = "wasi")]
+mod wasi_gui;
+#[cfg(target_os = "wasi")]
+pub use wasi_gui::*;
 
 // bridge fns used by the platform backend — operate on the shared Gui type
 fn layout_paint(g: &mut Gui, root: *mut ZUiC, t: &dyn TextOut) {
     g.texts.clear();
+    g.laid.clear();
     let w = g.fb_w as i32;
     layout(g, root, 0, 0, w, t);
     let laid = core::mem::take(&mut g.laid);
@@ -542,7 +547,7 @@ pub unsafe extern "C" fn zap_gui_run(root: *mut ZUiC, invoke: ZInvokeCb, refresh
             _ => return 0,
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
     {
         let Some(win) = (unsafe { root.as_ref() }) else { return 0 };
         let mut root = root;
@@ -567,5 +572,11 @@ pub unsafe extern "C" fn zap_gui_run(root: *mut ZUiC, invoke: ZInvokeCb, refresh
             }
             _ => return 0,
         }
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
+    {
+        // no native windowing on this target (wasi/web): headless
+        let _ = (root, invoke, refresh, efficient);
+        0
     }
 }

@@ -2299,7 +2299,7 @@ impl Vm {
                         _ => None,
                     })
                     .or_else(|| self.ui.windows.first().cloned());
-                #[cfg(any(unix, windows))]
+                #[cfg(any(unix, windows, target_os = "wasi"))]
                 if let Some(w) = win {
                     let eff = self
                         .project

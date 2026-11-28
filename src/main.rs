@@ -120,6 +120,19 @@ fn run_embedded(root: &Path, cli_args: &[String]) -> Result<(), String> {
     let p = std::sync::Arc::new(project::load(root, false)?);
     let mut vm = project::vm_for(&p)?;
     vm.cli_args = cli_args.to_vec();
+    #[cfg(target_os = "wasi")]
+    {
+        // on web, ui.run returns after attaching the GUI tree and the
+        // JS shim keeps calling back into the Vm (zap_gui_step → click
+        // handlers) after _start has returned; the Vm must be leaked
+        // so it outlives this stack frame.
+        let vm: &'static mut interp::Vm = Box::leak(Box::new(vm));
+        return match vm.run_main() {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("runtime error: {}", e.msg)),
+        };
+    }
+    #[cfg(not(target_os = "wasi"))]
     match vm.run_main() {
         Ok(_) => Ok(()),
         Err(e) => Err(format!("runtime error: {}", e.msg)),

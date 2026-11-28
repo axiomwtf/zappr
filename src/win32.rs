@@ -26,6 +26,7 @@ type Lparam = isize;
 type Lresult = isize;
 type Bool = i32;
 
+#[link(name = "gdi32")]
 unsafe extern "system" {
     fn GetModuleHandleW(name: *const u16) -> Hinstance;
     fn RegisterClassW(cls: *const WndClassW) -> u16;

@@ -61,7 +61,7 @@ zap (one Rust binary)
 ├── call-collector → transitive closure of calls (the whole inclusion story, §12)
 ├── codegen        → native codegen for linux / windows / wasm (no LLVM)
 ├── linker config  → static binaries, Ed25519 signing
-└── ui runtime     → native renderer + DOM bridge for web
+└── ui runtime     → native renderer + canvas bridge for web
 ```
 
 - **Parallel by module.** Independent `.znz` files compile concurrently, Go-style.
@@ -527,12 +527,11 @@ main() {
 }
 ```
 
-One rule: **mutate an element's property and it updates.** Setting `.text` patches exactly that node — on desktop in the native renderer, on web in the DOM. No `getElementById`, no innerHTML, no re-render.
+One rule: **mutate an element's property and it updates.** Setting `.text` patches exactly that node — on desktop in the native renderer, on web on the next canvas frame. No `getElementById`, no innerHTML, no re-render.
 
 ### 16.2 Rendering law
 
-- **Frame-locked.** The loop emits frames only on tick boundaries.
-- **Lazy.** A property change marks the window dirty; the next tick renders exactly one frame; the window goes clean and the loop **sleeps**. A static UI consumes zero CPU.
+- **Always repainting.** The loop renders on every event-loop pass at the display's refresh cadence (`requestAnimationFrame` on web, a non-blocking pump natively), so state changes appear at max frame rate. There is no dirty gating and no sleeping.
 - **`frameRate: auto`** (default) — the app mirrors the device's *actual* frame production, exactly, absorbing its jitter, tracking changes mid-run. A number (`frameRate: 144`) is a hard lock.
 - **`efficientRedraw`** (default `false`) — when on, the renderer diffs each frame against what is actually on screen and redraws only the changed regions: a moved element repaints its old spot and its new spot, nothing else. No gating, no dirty tracking — every frame still renders, but only damaged areas are uploaded and composited. Off by default; the full-frame path is the reference behavior.
 
@@ -602,8 +601,8 @@ dist/debug/<name>.exe      /// --target=windows
 dist/debug/<name>.wasm + <name>.html   /// --target=web
 ```
 
-- **linux / windows:** one static executable per platform. License headers ride inside the binary as a comment section. The native renderer is statically linked Rust: Wayland (wl_shm + xdg-shell, real server-side decorations) on Linux; X11 is not used. Windows uses Win32 GDI.
-- **web:** exactly two files — `<name>.wasm` (the whole program, UI engine included) and `<name>.html` (a small, static, self-contained wasm loader, stamped verbatim from inside zap — same bytes for every project). No JS shims, no bundler, no hidden third file. The loader fetches the `.wasm` sitting next to it, strips the signature trailer, instantiates and wires the env imports. If a feature needs more JS than the loader contains, it is a spec violation and zap says so.
+- **linux / windows:** one static executable per platform. License headers ride inside the binary as a comment section. The native renderer is statically linked Rust: Wayland (wl_shm + xdg-shell, real server-side decorations) on Linux; X11 is not used. Windows uses Win32 GDI. The executable is the zap host binary (the full Rust toolchain runtime) with the project source tree packed into a `ZAPP` footer archive; at startup the host extracts it to a content-keyed cache dir and runs `main` in-process. No external compiler, linker or runtime is involved at build or run time.
+- **web:** exactly two files: `<name>.wasm` (the whole program, UI engine included, compiled to `wasm32-wasip1`) and `<name>.html` (a small, static, self-contained loader stamped verbatim from inside zap, same bytes for every project). The project archive rides inside the `.wasm` as a `zappr` custom section; the loader carries a minimal WASI preview1 shim over an in-memory filesystem, extracts the archive before `_start`, and afterwards drives the GUI: the wasm host renders frames into an exported framebuffer and the page blits damage rects to a `<canvas>` via `putImageData`, feeding pointer events back through exported entry points. No JS shims beyond the loader, no bundler, no hidden third file.
 
 ### 18.2 Signing
 

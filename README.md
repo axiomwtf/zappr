@@ -211,7 +211,7 @@ main() {
 }
 ```
 
-One rule: **mutate an element's property and it updates.** The loop is frame-locked and lazy — a property change marks the window dirty, the next tick renders exactly one frame, and the loop sleeps. `frameRate: auto` (default) mirrors the device's actual frame production; a number is a hard lock. Routes are built in, same API native and web: `route("/users/{id}", UserPage)` with path params binding like arguments; navigation is `nav.go("/settings")`.
+One rule: **mutate an element's property and it updates.** The loop repaints every event-loop pass at the display's refresh cadence (`requestAnimationFrame` on web, a non-blocking pump natively), and `efficientRedraw: true` limits uploads to damaged regions. `frameRate: auto` (default) mirrors the device's actual frame production; a number is a hard lock. Routes are built in, same API native and web: `route("/users/{id}", UserPage)` with path params binding like arguments; navigation is `nav.go("/settings")`.
 
 UI state has a three-tier lifecycle, automatic: hot (on screen), cold (navigated away, survives in RAM), gone (unused past `stateTtl`, default 10 minutes, LRU). zap warns when `stateTtl` is not declared.
 
@@ -304,8 +304,8 @@ zap copyright headers     # stamp license headers, on explicit intent only
 
 ### Build outputs
 
-- **linux / windows:** one static executable per platform. License headers ride inside the binary as a comment section.
-- **web:** exactly two files — `app.wasm` (the whole program, UI engine included) and `404.html` (a small, static, self-contained wasm loader, stamped verbatim from inside zap — same bytes for every project). No JS shims, no bundler, no hidden third file. `404.html` is named so GitHub Pages routes deep links into the app.
+- **linux / windows:** one static executable per platform: the zap host binary with the project tree packed into a `ZAPP` footer archive, self-extracting and running `main` in-process. License headers ride inside the binary as a comment section.
+- **web:** exactly two files: `<name>.wasm` (the whole program compiled to `wasm32-wasip1`, project archive embedded as a `zappr` custom section) and `<name>.html` (a small, static, self-contained wasm loader stamped verbatim from inside zap, same bytes for every project). The loader carries a minimal WASI preview1 shim over an in-memory filesystem, then drives the GUI on a `<canvas>`: the host renders frames into an exported framebuffer and the page uploads damage rects per animation frame. No JS shims beyond the loader, no bundler, no hidden third file.
 
 ### zap fmt — the janitor
 
