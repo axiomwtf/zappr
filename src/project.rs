@@ -212,6 +212,8 @@ pub fn vm_for(p: &std::sync::Arc<Project>) -> Result<Vm, String> {
     vm.set_zap_yaml(yval_to_value_map(&p.config.vals));
     // §19.1: the ui runtime's cold-state ttl comes from stateTtl in Zappr.yaml
     vm.prog.ui.lock().unwrap().state_ttl = p.config.state_ttl.clone();
+    // §7.5: autoNull — absent values read as wrongReturnType poison
+    vm.set_auto_null(p.config.auto_null);
     Ok(vm)
 }
 

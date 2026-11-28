@@ -170,17 +170,23 @@ fn detect_license(root: &Path) -> Result<String, String> {
 }
 
 fn header_for(root: &Path) -> Result<String, String> {
-    // licenseHolder from Zappr.yaml if present
+    // the parsed Zappr.yaml is the source of truth — license: overrides
+    // fuzzy-matching, licenseHolder: names the holder (§18.4)
     let yaml = root.join("Zappr.yaml");
     let mut holder = "the authors".to_string();
+    let mut license_override: Option<String> = None;
     if let Ok(src) = std::fs::read_to_string(&yaml) {
-        for line in src.lines() {
-            if let Some(rest) = line.strip_prefix("licenseHolder:") {
-                holder = rest.trim().to_string();
+        if let Ok(c) = crate::config::parse(&src) {
+            if let Some(h) = &c.license_holder {
+                holder = h.clone();
             }
+            license_override = c.license.clone();
         }
     }
-    let lic = detect_license(root)?;
+    let lic = match license_override {
+        Some(l) => l,
+        None => detect_license(root)?,
+    };
     Ok(format!(
         "/// Copyright (c) {holder}. Licensed under {lic} — see LICENSE.\n"
     ))

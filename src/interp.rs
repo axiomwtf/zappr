@@ -71,6 +71,8 @@ pub struct Prog {
     /// owning project (set by vm_for) — lets ui.run hand off to the
     /// compiled native renderer (§16)
     pub project: Option<std::sync::Arc<crate::project::Project>>,
+    /// autoNull: true (§7.5) — absent values read as wrongReturnType poison
+    pub auto_null: bool,
 }
 
 pub struct Vm {
@@ -168,6 +170,7 @@ impl Vm {
                 ui: Arc::new(Mutex::new(crate::uiruntime::UiRuntime::new())),
                 cli_args: Vec::new(),
                 project: None,
+                auto_null: false,
             }),
             cur_module: "main".into(),
             scopes: vec![Arc::new(Mutex::new(HashMap::new()))],
@@ -200,6 +203,11 @@ impl Vm {
 
     pub fn set_cli_args(&mut self, args: Vec<String>) {
         self.prog_mut().cli_args = args;
+    }
+
+    /// autoNull: true (§7.5) — absent values read as wrongReturnType poison
+    pub fn set_auto_null(&mut self, on: bool) {
+        self.prog_mut().auto_null = on;
     }
 
     pub fn set_project(&mut self, p: Option<std::sync::Arc<crate::project::Project>>) {
@@ -1518,10 +1526,22 @@ impl Vm {
             // field writes mutate it and the CLI's caller persists them)
             return Ok(self.prog.zap_yaml.clone());
         }
-        self.get(name).ok_or_else(|| RuntimeError {
+        let v = self.get(name).ok_or_else(|| RuntimeError {
             msg: format!("unknown name `{name}`"),
             line: self.cur_line,
-        })
+        })?;
+        // autoNull (§7.5): optionality is inferred, padding is automatic,
+        // access auto-unwraps — an absent value read surfaces as
+        // wrongReturnType at first use. The explicit pad form is unchanged.
+        if self.prog.auto_null && matches!(v, Value::Nothing) {
+            return Ok(Value::Poison {
+                kind: PoisonKind::WrongReturnType,
+                origin: format!("optional access to `{name}`"),
+                expected: "a value".into(),
+                actual: "null".into(),
+            });
+        }
+        Ok(v)
     }
 
     fn eval_str(&mut self, parts: &[StrPart]) -> Result<Value, RuntimeError> {
