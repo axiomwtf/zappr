@@ -11,30 +11,39 @@ pub fn run(root: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    // 1. copyright headers
-    let missing: Vec<_> = files
-        .iter()
-        .filter(|(_, src)| !has_header(src))
-        .collect();
-    if !missing.is_empty() {
+    // 1. copyright headers — missing or stale (§18.4: updated in place)
+    let header = match header_for(root) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            println!("zap fmt: headers skipped ({e})");
+            None
+        }
+    };
+    let needs_header: Vec<_> = match &header {
+        Some(h) => files
+            .iter()
+            .filter(|(_, src)| !has_header(src) || stale_header_block(src, h).is_some())
+            .collect(),
+        None => Vec::new(),
+    };
+    if !needs_header.is_empty() {
+        let h = header.as_deref().unwrap();
         println!(
-            "zap fmt: add copyright headers to {} files? (y/n/a)",
-            missing.len()
+            "zap fmt: add or update copyright headers in {} files? (y/n/a)",
+            needs_header.len()
         );
         match ask()? {
             Consent::Yes => {
-                let header = header_for(root)?;
-                for (p, _) in &missing {
-                    stamp(p, &header)?;
+                for (p, _) in &needs_header {
+                    stamp(p, h)?;
                     println!("  stamped {}", p.display());
                 }
             }
             Consent::All => {
-                let header = header_for(root)?;
-                for (p, _) in &missing {
-                    stamp(p, &header)?;
+                for (p, _) in &needs_header {
+                    stamp(p, h)?;
                 }
-                println!("  stamped {} files", missing.len());
+                println!("  stamped {} files", needs_header.len());
             }
             Consent::No => {}
         }
@@ -177,9 +186,23 @@ fn header_for(root: &Path) -> Result<String, String> {
     ))
 }
 
-/// Idempotent: skip files that already carry the header.
+/// Idempotent AND self-healing (§18.4): files missing the header get it
+/// prepended; files carrying a stale header (different license text) get
+/// the stale header block replaced in place.
 fn stamp(path: &Path, header: &str) -> Result<(), String> {
     let src = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    if let Some((start, end)) = stale_header_block(&src, header) {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = String::with_capacity(src.len() + header.len());
+        out.push_str(header.trim_end());
+        out.push('\n');
+        for l in &lines[end..] {
+            out.push_str(l);
+            out.push('\n');
+        }
+        let _ = start;
+        return std::fs::write(path, out).map_err(|e| e.to_string());
+    }
     if has_header(&src) {
         return Ok(());
     }
@@ -190,22 +213,50 @@ fn stamp(path: &Path, header: &str) -> Result<(), String> {
     std::fs::write(path, out).map_err(|e| e.to_string())
 }
 
+/// The file's leading `///` block when it is a copyright/license header
+/// that differs from `header` — (first line idx, one-past-last line idx).
+fn stale_header_block(src: &str, header: &str) -> Option<(usize, usize)> {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut end = 0;
+    for (i, l) in lines.iter().enumerate() {
+        if l.trim_start().starts_with("///") {
+            end = i + 1;
+        } else {
+            break;
+        }
+    }
+    if end == 0 {
+        return None;
+    }
+    let block = lines[..end].join("\n");
+    let expected = header.trim_end();
+    // a header from a previous stamping pass, but with old text → stale
+    if block != expected && block.contains("Copyright") {
+        Some((0, end))
+    } else {
+        None
+    }
+}
+
 /// `zap copyright headers` — explicit intent only (§18.4).
 pub fn copyright_headers(root: &Path) -> Result<(), String> {
     let files = collect_znz(root.join("zap"))?;
-    let missing: Vec<_> = files.iter().filter(|(_, s)| !has_header(s)).collect();
-    if missing.is_empty() {
+    let header = header_for(root)?;
+    let targets: Vec<_> = files
+        .iter()
+        .filter(|(_, s)| !has_header(s) || stale_header_block(s, &header).is_some())
+        .collect();
+    if targets.is_empty() {
         println!("zap copyright headers: all files already stamped");
         return Ok(());
     }
-    println!("zap copyright headers: stamp {} files? (y/n/a)", missing.len());
+    println!("zap copyright headers: stamp or update {} files? (y/n/a)", targets.len());
     match ask()? {
         Consent::Yes | Consent::All => {
-            let header = header_for(root)?;
-            for (p, _) in &missing {
+            for (p, _) in &targets {
                 stamp(p, &header)?;
             }
-            println!("zap copyright headers: stamped {} files", missing.len());
+            println!("zap copyright headers: stamped {} files", targets.len());
         }
         Consent::No => println!("zap copyright headers: skipped"),
     }

@@ -401,6 +401,11 @@ fn cmd_test(_rest: &[String]) -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     // tests live in zap/tests/ — load everything including tests
     let p = std::sync::Arc::new(project::load(&cwd, true)?);
+    // compile errors gate tests, same as build and run (§7.6)
+    let notes = project::check_project(&p)?;
+    for n in &notes {
+        eprintln!("zap: {n}");
+    }
     let mut vm = project::vm_for(&p)?;
     // run test.znz's entry: prefer `test`, then `main`, in the testsTest module
     for entry in ["testsTest.test", "testsTest.main", "test", "main"] {

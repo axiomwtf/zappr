@@ -22,6 +22,13 @@ pub fn collect_files(p: &crate::project::Project) -> Result<Vec<(String, PathBuf
     let yaml = p.root.join("Zappr.yaml");
     out.push(("Zappr.yaml".into(), yaml));
 
+    // §18.4: the license travels with the artifact — LICENSE rides inside
+    // the embedded archive, so every artifact carries its license text.
+    let lic = p.root.join("LICENSE");
+    if lic.is_file() {
+        out.push(("LICENSE".into(), lic));
+    }
+
     let zap_dir = p.root.join("zap");
     collect_dir(&zap_dir, &p.root, &mut out)?;
 

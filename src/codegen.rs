@@ -107,6 +107,9 @@ fn build_cache_key(p: &Project, target: &str, release: bool) -> u64 {
         if let Ok(b) = std::fs::read(path) { b.hash(&mut h); }
     }
     if let Ok(b) = std::fs::read(p.root.join("Zappr.yaml")) { b.hash(&mut h); }
+    // §18.4: the license travels with the artifact — a changed LICENSE
+    // must invalidate the cached artifact
+    if let Ok(b) = std::fs::read(p.root.join("LICENSE")) { b.hash(&mut h); }
     for rel in &p.config.cli {
         if let Ok(b) = std::fs::read(p.root.join(rel)) { b.hash(&mut h); }
     }
@@ -589,9 +592,21 @@ fn build_web(p: &Project, out: &Path) -> Result<(), String> {
     section.extend_from_slice(&u32leb(payload_len.len() as u32));
     section.extend_from_slice(&payload_len);
 
-    let mut artifact = Vec::with_capacity(wasm.len() + section.len() + 100);
+    let mut artifact = Vec::with_capacity(wasm.len() + section.len() + 200);
     artifact.extend_from_slice(&wasm[..8]);
     artifact.extend_from_slice(&section);
+    // §18.4: the license travels with the artifact — a `license` custom
+    // section carries the LICENSE text inside the .wasm itself.
+    if let Ok(lic) = std::fs::read_to_string(p.root.join("LICENSE")) {
+        let lname = b"license";
+        let mut lpay = u32leb(lname.len() as u32);
+        lpay.extend_from_slice(lname);
+        lpay.extend_from_slice(lic.as_bytes());
+        let mut lsec = vec![0x00u8];
+        lsec.extend_from_slice(&u32leb(lpay.len() as u32));
+        lsec.extend_from_slice(&lpay);
+        artifact.extend_from_slice(&lsec);
+    }
     artifact.extend_from_slice(&wasm[8..]);
 
     // sign (§18.2): trailer is stripped by the html loader before compile
@@ -615,11 +630,25 @@ fn build_web(p: &Project, out: &Path) -> Result<(), String> {
 
     let wasm_name = "app.wasm";
     let title = p.config.name.clone().unwrap_or_else(|| "zap app".into());
+    // §18.4: the license rides as a comment in the web artifact
+    let lic_comment = std::fs::read_to_string(p.root.join("LICENSE"))
+        .map(|l| {
+            let one_line: String = l
+                .lines()
+                .map(|ln| format!("{} ", ln.trim()))
+                .collect::<String>()
+                .replace("-->", "--\\x3e")
+                .trim()
+                .to_string();
+            format!("<!--\nLicense:\n{one_line}\n-->\n")
+        })
+        .unwrap_or_default();
     let js = include_str!("webshim.js")
         .replace("__ZAP_WASM_NAME__", wasm_name)
         .replace("__ZAP_TITLE__", &title);
     let html = format!(
         "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>{title}</title>\n\
+         {lic_comment}\
          <style>body{{background:#111;color:#ddd;font:14px/1.5 monospace;padding:1em;white-space:pre-wrap}}</style>\n\
          </head><body><div id=\"out\"></div><script>\n{js}\n</script></body></html>\n"
     );

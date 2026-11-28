@@ -26,6 +26,11 @@ fn check_magic_and_signature(data: &[u8]) -> Result<(), String> {
     }
     let t = &data[data.len() - TRAILER_LEN..];
     if &t[..4] != MAGIC {
+        // an unsigned artifact (sign:false) is a real artifact with no
+        // trailer — say so instead of a misleading "bad magic"
+        if crate::pack::find_embedded(data).is_some() {
+            return Err("artifact is unsigned (sign: false in Zappr.yaml) — nothing to verify".into());
+        }
         return Err("not a Zappr artifact (bad magic)".into());
     }
     let payload = &data[..data.len() - TRAILER_LEN];
