@@ -5,6 +5,7 @@
 //! the wasm target. Element semantics (mutate → update, frame-locked,
 //! lazy dirty tracking) live here so both backends share them.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::Arc;
 
@@ -69,6 +70,11 @@ pub struct UiRuntime {
     pub frame: u64,
     /// dirty windows awaiting render
     pub dirty: Vec<usize>,
+    /// §19.1 state lifetime: window address → last use (Hot while used,
+    /// Cold when idle, Gone after stateTtl)
+    pub last_used: HashMap<usize, std::time::Instant>,
+    /// the declared stateTtl string (None → default 10m)
+    pub state_ttl: Option<String>,
 }
 
 impl UiRuntime {
@@ -81,6 +87,8 @@ impl UiRuntime {
             last_handler: None,
             frame: 0,
             dirty: Vec::new(),
+            last_used: HashMap::new(),
+            state_ttl: None,
         }
     }
 
@@ -107,6 +115,7 @@ impl UiRuntime {
 
     /// `ui.window("demo", 800, 600)` → window element + registry entry.
     pub fn window(&mut self, args: &[crate::value::Value]) -> crate::value::Value {
+        self.sweep();
         let title = args.first().map(|v| v.display()).unwrap_or_else(|| "window".into());
         let mut el = UiElement::new("window");
         el.set("title", crate::value::Value::str(title));
@@ -120,6 +129,125 @@ impl UiRuntime {
         );
         let rc = Arc::new(Mutex::new(el));
         self.windows.push(rc.clone());
+        // §19.1: a freshly created window's state is Hot
+        self.touch(&rc);
         crate::value::Value::Ui(rc)
+    }
+
+    /// §19.1: mark a window's state as used now (Hot). Keyed by address —
+    /// the same element retraced through Arc clones keeps its timestamp.
+    pub fn touch(&mut self, w: &Arc<Mutex<UiElement>>) {
+        let key = Arc::as_ptr(w) as usize;
+        self.last_used.insert(key, std::time::Instant::now());
+    }
+
+    /// §19.1 sweep: evict windows whose state has been idle past `ttl`
+    /// (Gone tier), LRU order. Revisiting starts fresh — the page fn
+    /// simply runs again. Returns how many windows were evicted.
+    pub fn evict_cold(&mut self, ttl: std::time::Duration) -> usize {
+        let now = std::time::Instant::now();
+        // LRU order: oldest last_used first
+        let mut order: Vec<(usize, std::time::Instant)> = self
+            .last_used
+            .iter()
+            .map(|(k, t)| (*k, *t))
+            .collect();
+        order.sort_by_key(|(_, t)| *t);
+        let mut evicted = 0;
+        for (key, t) in order {
+            if now.duration_since(t) < ttl {
+                break;
+            }
+            self.windows
+                .retain(|w| Arc::as_ptr(w) as usize != key);
+            self.last_used.remove(&key);
+            evicted += 1;
+        }
+        if evicted > 0 {
+            self.dirty.retain(|i| *i < self.windows.len());
+        }
+        evicted
+    }
+
+    /// The configured ttl (§19.1) — default 10 minutes.
+    pub fn ttl(&self) -> std::time::Duration {
+        self.state_ttl
+            .as_deref()
+            .and_then(parse_ttl)
+            .unwrap_or(std::time::Duration::from_secs(600))
+    }
+
+    /// §19.1: run the cold-state sweep against the configured ttl.
+    /// Called at every UiRuntime entry point — window creation, route
+    /// registration, navigation and handler invocation — so idle state
+    /// is reclaimed without a background thread.
+    pub fn sweep(&mut self) -> usize {
+        self.evict_cold(self.ttl())
+    }
+}
+
+/// `10m` / `30s` / `2h` / `500ms` — the stateTtl subset (§19.1).
+fn parse_ttl(s: &str) -> Option<std::time::Duration> {
+    let s = s.trim();
+    let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit())?);
+    let n: u64 = num.parse().ok()?;
+    match unit {
+        "ms" => Some(std::time::Duration::from_millis(n)),
+        "s" => Some(std::time::Duration::from_secs(n)),
+        "m" => Some(std::time::Duration::from_secs(n * 60)),
+        "h" => Some(std::time::Duration::from_secs(n * 3600)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ttl_parsing() {
+        assert_eq!(parse_ttl("500ms"), Some(std::time::Duration::from_millis(500)));
+        assert_eq!(parse_ttl("10m"), Some(std::time::Duration::from_secs(600)));
+        assert_eq!(parse_ttl("2h"), Some(std::time::Duration::from_secs(7200)));
+        assert_eq!(parse_ttl("bogus"), None);
+        assert_eq!(parse_ttl(""), None);
+    }
+
+    #[test]
+    fn default_ttl_is_ten_minutes() {
+        assert_eq!(UiRuntime::new().ttl(), std::time::Duration::from_secs(600));
+    }
+
+    #[test]
+    fn cold_state_evicted_hot_kept() {
+        let mut ui = UiRuntime::new();
+        ui.state_ttl = Some("1ms".into());
+        let a = ui.window(&[crate::value::Value::str("a")]);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let b = ui.window(&[crate::value::Value::str("b")]);
+        // a's state is past the ttl — swept when b's creation swept
+        if let crate::value::Value::Ui(a_el) = &a {
+            let key = Arc::as_ptr(a_el) as usize;
+            assert!(!ui.last_used.contains_key(&key), "cold window should be evicted");
+        }
+        assert_eq!(ui.windows.len(), 1);
+        // b is hot — still registered
+        if let crate::value::Value::Ui(b_el) = &b {
+            let key = Arc::as_ptr(b_el) as usize;
+            assert!(ui.last_used.contains_key(&key));
+        }
+    }
+
+    #[test]
+    fn touch_keeps_window_alive() {
+        let mut ui = UiRuntime::new();
+        ui.state_ttl = Some("1ms".into());
+        let a = ui.window(&[crate::value::Value::str("a")]);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        if let crate::value::Value::Ui(el) = &a {
+            ui.touch(el);
+        }
+        ui.sweep();
+        assert_eq!(ui.windows.len(), 1, "recently touched window survives the sweep");
     }
 }

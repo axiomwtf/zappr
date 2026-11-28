@@ -284,6 +284,8 @@ unsafe extern "C" fn host_invoke(fv: *const ZValC) {
     let hf = unsafe { &*(fnp as *const HostFn) };
     let func = hf.f.clone();
     let vm = unsafe { &mut *HOST_VM };
+    // §19.1: handler invocation is a ui entry point — sweep cold state
+    vm.prog.ui.lock().unwrap().sweep();
     let _ = vm.call_gui_func(&func, vec![Value::Nothing]);
 }
 

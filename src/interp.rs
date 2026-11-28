@@ -2121,6 +2121,8 @@ impl Vm {
                 .collect::<Vec<_>>()
         };
         let url_segs = segments(path);
+        // §19.1: navigation is a ui entry point — sweep cold state first
+        self.prog.ui.lock().unwrap().sweep();
         let routes = self.prog.ui.lock().unwrap().routes.clone();
         for r in &routes {
             let pat_html = r.pattern.ends_with(".html");
