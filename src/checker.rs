@@ -259,6 +259,41 @@ fn is_type_name(n: &str) -> bool {
     n.chars().next().is_some_and(|c| c.is_uppercase())
 }
 
+/// Does this block always exit via `return` — control never reaches the
+/// statements after it? Conservative: `break`/`continue`, a fallthrough,
+/// and nested loops all count as reaching onward code (a nested loop
+/// absorbs its own breaks, so we do not look inside it).
+fn always_returns(body: &[Stmt]) -> bool {
+    for s in body {
+        match s {
+            Stmt::Return(_) => return true,
+            Stmt::Break | Stmt::Continue => return false,
+            Stmt::If {
+                then_body,
+                else_body: Some(eb),
+                ..
+            } => {
+                if always_returns(then_body) && always_returns(eb) {
+                    return true;
+                }
+            }
+            Stmt::Match { arms, .. } => {
+                let has_else = arms.iter().any(|a| a.ty.is_none());
+                if has_else && arms.iter().all(|a| always_returns(&a.body)) {
+                    return true;
+                }
+            }
+            Stmt::ForInfinite { body, .. } => {
+                if always_returns(body) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Top-level names a parallel body statement publishes upward (§14) —
 /// mirrors the runtime's publish rule: only `!x = ...` / `!(a, b) = ...`
 /// statements of the block's own top level publish.
@@ -509,6 +544,21 @@ impl Checker<'_> {
         }
     }
 
+    /// Run a nested block, discarding moves that cannot outlive it: when the
+    /// block always exits via `return`, control never reaches the code after
+    /// it, so moves made inside are invisible there (§15.1).
+    fn block(&mut self, body: &[Stmt], module: &str, fname: &str) {
+        let snapshot = if always_returns(body) {
+            Some(self.moved.clone())
+        } else {
+            None
+        };
+        self.stmts(body, module, fname);
+        if let Some(snap) = snapshot {
+            self.moved = snap;
+        }
+    }
+
     fn stmt(&mut self, s: &Stmt, module: &str, fname: &str) {
         match s {
             Stmt::Decl {
@@ -555,6 +605,12 @@ impl Checker<'_> {
             } => {
                 if !self.lookup(target) {
                     self.errors.push(format!("`{target}` is not declared — use `!{target} =` to declare"));
+                }
+                // §6.2: the casing is the modifier — PascalCase never rebinds
+                if target.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                    self.errors.push(format!(
+                        "`{target}` is PascalCase — a const; `/{target} =` is a compile error (§6.2)"
+                    ));
                 }
                 if target == "val" && !self.val_writes_ok {
                     self.errors.push(
@@ -608,7 +664,7 @@ impl Checker<'_> {
                     let vty = fntype_narrow(cond);
                     self.declare(b, cp, vty);
                 }
-                self.stmts(then_body, module, fname);
+                self.block(then_body, module, fname);
                 self.scope.pop();
                 if let Some(eb) = else_body {
                     self.scope.push(HashMap::new());
@@ -616,7 +672,7 @@ impl Checker<'_> {
                         let cp = self.copyable_expr(cond);
                         self.declare(b, cp, VarTy::Unknown);
                     }
-                    self.stmts(eb, module, fname);
+                    self.block(eb, module, fname);
                     self.scope.pop();
                 }
             }
@@ -642,7 +698,7 @@ impl Checker<'_> {
                         }
                     }
                 }
-                self.stmts(body, module, fname);
+                self.block(body, module, fname);
                 self.scope.pop();
                 if root.is_some() {
                     self.borrows.pop();
@@ -651,12 +707,12 @@ impl Checker<'_> {
             Stmt::ForCond { cond, body, .. } => {
                 self.walk(cond, false, module, fname);
                 self.scope.push(HashMap::new());
-                self.stmts(body, module, fname);
+                self.block(body, module, fname);
                 self.scope.pop();
             }
             Stmt::ForInfinite { body, .. } => {
                 self.scope.push(HashMap::new());
-                self.stmts(body, module, fname);
+                self.block(body, module, fname);
                 self.scope.pop();
             }
             Stmt::ForCStyle { init, cond, post, body, .. } => {
@@ -669,7 +725,7 @@ impl Checker<'_> {
                     self.stmt(s, module, fname);
                 }
                 self.scope.push(HashMap::new());
-                self.stmts(body, module, fname);
+                self.block(body, module, fname);
                 self.scope.pop();
                 self.scope.pop();
             }
@@ -748,7 +804,7 @@ impl Checker<'_> {
             };
             self.declare(b, false, ty);
         }
-        self.stmts(&arm.body, module, fname);
+        self.block(&arm.body, module, fname);
         self.scope.pop();
     }
 
@@ -881,7 +937,7 @@ impl Checker<'_> {
                     self.arity_check(callee, args, module, fname);
                     self.with_captured(|c| {
                         c.scope.push(HashMap::new());
-                        c.stmts(body, module, fname);
+                        c.block(body, module, fname);
                         c.scope.pop();
                     });
                 } else {
