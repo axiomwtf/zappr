@@ -1330,7 +1330,7 @@ impl Vm {
 
     pub fn eval(&mut self, e: &Expr) -> Result<Value, RuntimeError> {
         match e {
-            Expr::Int(i) => Ok(Value::Int(*i as i128)),
+            Expr::Int(i) => Ok(Value::Int(*i)),
             Expr::Float(f) => Ok(Value::Float(*f)),
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Null => Ok(Value::Nothing),
@@ -1383,14 +1383,16 @@ impl Vm {
             Expr::Cast { expr, ty } => {
                 let v = self.eval(expr)?;
                 let tr = self.type_expr_repr(ty);
-                if v.satisfies(&tr) {
-                    Ok(v)
-                } else {
-                    // numeric cast as u8 etc → truncate
-                    if let TypeRepr::Int = tr {
+                // numeric cast: narrow to the named width — a cast truncates
+                // because you said so (§7.1). `int` and unknown widths keep
+                // the value as-is; non-numeric casts go through satisfies.
+                if let TypeRepr::Int = tr {
+                    if let Some(w) = cast_width(ty) {
                         return match v {
-                            Value::Int(i) => Ok(Value::Int(i)),
-                            Value::Float(f) => Ok(Value::Int(f as i128)),
+                            Value::Int(i) => Ok(Value::Int(trunc_int(i, Some(w)))),
+                            Value::Float(f) => {
+                                Ok(Value::Int(trunc_int(f as i128, Some(w))))
+                            }
                             _ => Ok(Value::Poison {
                                 kind: PoisonKind::WrongReturnType,
                                 origin: "as cast".into(),
@@ -1399,6 +1401,19 @@ impl Vm {
                             }),
                         };
                     }
+                    return match v {
+                        Value::Int(_) | Value::Float(_) => Ok(v),
+                        _ => Ok(Value::Poison {
+                            kind: PoisonKind::WrongReturnType,
+                            origin: "as cast".into(),
+                            expected: tr.name(),
+                            actual: v.type_repr().name(),
+                        }),
+                    };
+                }
+                if v.satisfies(&tr) {
+                    Ok(v)
+                } else {
                     Ok(Value::Poison {
                         kind: PoisonKind::WrongReturnType,
                         origin: "as cast".into(),
@@ -2908,8 +2923,43 @@ fn default_for(t: &TypeRepr) -> Value {
     }
 }
 
-fn fuse_name(parts: &[String]) -> String {
-    let mut out = String::new();
+/// Bit width + signedness of a fixed-width integer type name, or None for
+/// `int` (§7.1).
+fn cast_width(ty: &TypeExpr) -> Option<(&'static str, u32, bool)> {
+    let TypeExpr::Named(n) = ty else {
+        return None;
+    };
+    match n.as_str() {
+        "i8" => Some(("i8", 8, true)),
+        "i16" => Some(("i16", 16, true)),
+        "i32" => Some(("i32", 32, true)),
+        "i64" => Some(("i64", 64, true)),
+        "u8" => Some(("u8", 8, false)),
+        "u16" => Some(("u16", 16, false)),
+        "u32" => Some(("u32", 32, false)),
+        "u64" => Some(("u64", 64, false)),
+        _ => None,
+    }
+}
+
+/// Truncate to a fixed width, two's complement — `as u8` on 300 is 44,
+/// `as i8` on 200 is -56, `as u8` on -5 is 251. None width = no change.
+fn trunc_int(i: i128, w: Option<(&'static str, u32, bool)>) -> i128 {
+    match w {
+        None => i,
+        Some(("i8", ..)) => (i as i8) as i128,
+        Some(("i16", ..)) => (i as i16) as i128,
+        Some(("i32", ..)) => (i as i32) as i128,
+        Some(("i64", ..)) => (i as i64) as i128,
+        Some(("u8", ..)) => (i as u8) as i128,
+        Some(("u16", ..)) => (i as u16) as i128,
+        Some(("u32", ..)) => (i as u32) as i128,
+        Some(("u64", ..)) => (i as u64) as i128,
+        Some(_) => i,
+    }
+}
+
+fn fuse_name(parts: &[String]) -> String {    let mut out = String::new();
     for (i, p) in parts.iter().enumerate() {
         if i == 0 {
             out.push_str(&p.to_lowercase());
