@@ -2928,6 +2928,7 @@ fn primitive_type(name: &str) -> Option<TypeRepr> {
         "str" => TypeRepr::Str,
         "bool" => TypeRepr::Bool,
         "bytes" => TypeRepr::Bytes,
+        "Err" => TypeRepr::Err,
         _ => return None,
     })
 }

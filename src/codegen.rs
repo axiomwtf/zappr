@@ -619,16 +619,19 @@ fn build_web(p: &Project, out: &Path) -> Result<(), String> {
     } else {
         artifact
     };
-    // §18.1: the web target is exactly two files — app.wasm + 404.html.
-    // The 404 name makes GitHub Pages route deep links into the app; the
-    // loader reads the real URL and the router renders the right page.
+    // §18.1: the web target is exactly two files — <name>.wasm + <name>.html.
     let dir = out.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
-    let wasm_path = dir.join("app.wasm");
-    let html_path = dir.join("404.html");
+    let base = p
+        .config
+        .name
+        .clone()
+        .unwrap_or_else(|| "app".into());
+    let wasm_path = dir.join(format!("{base}.wasm"));
+    let html_path = dir.join(format!("{base}.html"));
     std::fs::write(&wasm_path, &artifact)
         .map_err(|e| format!("cannot write {}: {e}", wasm_path.display()))?;
 
-    let wasm_name = "app.wasm";
+    let wasm_name = format!("{base}.wasm");
     let title = p.config.name.clone().unwrap_or_else(|| "zap app".into());
     // §18.4: the license rides as a comment in the web artifact
     let lic_comment = std::fs::read_to_string(p.root.join("LICENSE"))
@@ -644,7 +647,7 @@ fn build_web(p: &Project, out: &Path) -> Result<(), String> {
         })
         .unwrap_or_default();
     let js = include_str!("webshim.js")
-        .replace("__ZAP_WASM_NAME__", wasm_name)
+        .replace("__ZAP_WASM_NAME__", &wasm_name)
         .replace("__ZAP_TITLE__", &title);
     let html = format!(
         "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>{title}</title>\n\
