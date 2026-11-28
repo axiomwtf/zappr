@@ -551,9 +551,13 @@
       }
       const archive = extractProject(bytes);
 
-      // argv: argv0 + one arg per ?key=value query pair
+      // argv: argv0 + one arg per ?key=value query pair + the URL path
+      // (§16.3 deep link: the router dispatches it as the initial route)
       const argv = [TITLE];
       new URLSearchParams(location.search).forEach((v, k) => argv.push(k + "=" + v));
+      if (location.pathname && location.pathname !== "/" && location.pathname !== "/404.html") {
+        argv.push(location.pathname);
+      }
 
       const shim = makeWasi(argv);
       const imports = { wasi_snapshot_preview1: shim.wasi };

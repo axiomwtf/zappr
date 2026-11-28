@@ -49,11 +49,19 @@ impl UiElement {
     }
 }
 
+/// A registered route: pattern + page fn (§16.3). Patterns are
+/// extensionless by default; `{param}` segments bind like arguments.
+#[derive(Debug, Clone)]
+pub struct Route {
+    pub pattern: String,
+    pub page: Option<Arc<crate::value::FuncVal>>,
+}
+
 /// The runtime: window registry, routes, navigation log, frame state.
 #[derive(Debug, Default)]
 pub struct UiRuntime {
     pub windows: Vec<Arc<Mutex<UiElement>>>,
-    pub routes: Vec<String>,
+    pub routes: Vec<Route>,
     pub navigations: Vec<String>,
     pub next_window: u32,
     pub last_handler: Option<Arc<crate::value::FuncVal>>,

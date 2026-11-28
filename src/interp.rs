@@ -88,6 +88,9 @@ pub struct Vm {
     /// §14 cancellation flag for tasks inside a failing `parallel` block —
     /// checked at statement safe points; None on the main Vm
     cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// > 0 while evaluating a route pattern argument — `{param}` segments
+    /// stay literal (§16.3)
+    pattern_depth: usize,
 }
 
 /// Live access state for one guarded cell (§15.1).
@@ -175,6 +178,7 @@ impl Vm {
             cur_line: 0,
             access: Arc::new(Mutex::new(AccessInner::default())),
             cancel: None,
+            pattern_depth: 0,
         }
     }
 
@@ -188,6 +192,7 @@ impl Vm {
             cur_line: self.cur_line,
             access: self.access.clone(),
             cancel,
+            pattern_depth: 0,
         }
     }
 
@@ -1544,6 +1549,15 @@ impl Vm {
             match p {
                 StrPart::Lit(s) => out.push_str(s),
                 StrPart::Interp(e) => {
+                    // route patterns keep `{param}` literal (§16.3)
+                    if self.pattern_depth > 0 {
+                        if let Expr::Ident(n) = e {
+                            out.push('{');
+                            out.push_str(n);
+                            out.push('}');
+                            continue;
+                        }
+                    }
                     let v = self.eval(e)?;
                     out.push_str(&v.display());
                 }
@@ -1899,7 +1913,11 @@ impl Vm {
         // evaluate args first (DeclArg/NamedArg handled by callers that need them)
         let mut vals = Vec::new();
         let mut named: Vec<(String, Value)> = Vec::new();
-        for a in args {
+        // route's pattern arg is literal — `{param}` segments are path
+        // placeholders, not interpolation (§16.3)
+        let is_route_pattern = matches!(callee, Expr::Ident(n) if n == "route")
+            && args.first().is_some();
+        for (i, a) in args.iter().enumerate() {
             match a {
                 Expr::NamedArg { name, value } => {
                     named.push((name.clone(), self.eval(value)?));
@@ -1907,7 +1925,16 @@ impl Vm {
                 Expr::DeclArg { .. } => {
                     return self.err("declare-and-read arg outside read()".into());
                 }
-                _ => vals.push(self.eval(a)?),
+                _ => {
+                    if is_route_pattern && i == 0 {
+                        self.pattern_depth += 1;
+                        let v = self.eval(a);
+                        self.pattern_depth -= 1;
+                        vals.push(v?);
+                    } else {
+                        vals.push(self.eval(a)?);
+                    }
+                }
             }
         }
         self.eval_callee(callee, vals, named)
@@ -2076,6 +2103,58 @@ impl Vm {
     /// Re-enter a FuncVal from the native GUI bridge's click callback.
     pub fn call_gui_func(&mut self, f: &Arc<FuncVal>, args: Vec<Value>) -> Result<Value, RuntimeError> {
         self.call_func_value(f, args)
+    }
+
+    /// §16.3 route dispatch: match `url` against registered routes.
+    /// Extensionless routes never match `.html` URLs; a route explicitly
+    /// named with `.html` does. `{param}` segments bind positionally.
+    /// Unmatched URLs are loud errors — silent 404s hide typos.
+    fn nav_dispatch(&mut self, url: &str) -> Result<Option<Value>, RuntimeError> {
+        // strip a query string; the router sees only the path
+        let path = url.split('?').next().unwrap_or(url);
+        let url_html = path.ends_with(".html");
+        let segments = |s: &str| {
+            s.trim_matches('/')
+                .split('/')
+                .filter(|p| !p.is_empty())
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+        };
+        let url_segs = segments(path);
+        let routes = self.prog.ui.lock().unwrap().routes.clone();
+        for r in &routes {
+            let pat_html = r.pattern.ends_with(".html");
+            if url_html != pat_html {
+                continue;
+            }
+            let pat_segs = segments(&r.pattern);
+            if pat_segs.len() != url_segs.len() {
+                continue;
+            }
+            let mut params: Vec<Value> = Vec::new();
+            let mut ok = true;
+            for (p, u) in pat_segs.iter().zip(url_segs.iter()) {
+                if p.starts_with('{') && p.ends_with('}') {
+                    params.push(Value::str(u.clone()));
+                } else if p != u {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            self.prog.ui.lock().unwrap().navigations.push(path.to_string());
+            if let Some(page) = &r.page {
+                let v = self.call_func_value(page, params)?;
+                return Ok(Some(v));
+            }
+            return Ok(None);
+        }
+        Err(RuntimeError {
+            msg: format!("nav.go: no route matches `{path}` (routes are extensionless; a `.html` URL matches only routes declared with `.html`) — SPEC §16.3"),
+            line: self.cur_line,
+        })
     }
 
     fn call_func_value(&mut self, f: &FuncVal, args: Vec<Value>) -> Result<Value, RuntimeError> {
@@ -2556,6 +2635,18 @@ impl Vm {
                         _ => None,
                     })
                     .or_else(|| self.prog.ui.lock().unwrap().windows.first().cloned());
+                // §16.3 deep link: on web the loader passes the real URL
+                // path as a leading argv entry — dispatch it as the initial
+                // route before the first frame
+                if let Some(initial) = self
+                    .prog
+                    .cli_args
+                    .iter()
+                    .find(|a| a.starts_with('/') && !a.starts_with("//"))
+                {
+                    let initial = initial.clone();
+                    self.nav_dispatch(&initial)?;
+                }
                 #[cfg(any(unix, windows, target_os = "wasi"))]
                 if let Some(w) = win {
                     let eff = self
@@ -2585,9 +2676,11 @@ impl Vm {
                 Ok(Some(Value::Nothing))
             }
             "nav.go" => {
-                // headless run: record navigation
+                // §16.3: dispatch the URL against registered routes —
+                // extensionless routes do not match `.html` URLs and vice
+                // versa; `{param}` segments bind like arguments
                 let url = args.first().map(|v| v.display()).unwrap_or_default();
-                self.prog.ui.lock().unwrap().navigations.push(url);
+                self.nav_dispatch(&url)?;
                 Ok(Some(Value::Nothing))
             }
             "thisShell.shellOut" => {
@@ -2738,7 +2831,14 @@ impl Vm {
             }
             "route" => {
                 let path = args.first().map(|v| v.display()).unwrap_or_default();
-                self.prog.ui.lock().unwrap().routes.push(path);
+                let page = args.iter().find_map(|v| match v {
+                    Value::Func(f) => Some(f.clone()),
+                    _ => None,
+                });
+                self.prog.ui.lock().unwrap().routes.push(crate::uiruntime::Route {
+                    pattern: path,
+                    page,
+                });
                 Ok(Value::Nothing)
             }
             "onClick" => {

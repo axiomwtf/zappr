@@ -132,6 +132,9 @@ struct Checker<'a> {
     top_decls: HashMap<String, VarTy>,
     /// `val:` writes are legal only inside a custom zap CLI module (§19.2)
     val_writes_ok: bool,
+    /// > 0 while walking a route pattern argument — `{param}` segments in
+    /// the string stay literal (§16.3)
+    pattern_depth: usize,
 }
 
 pub fn check_program(prog: &Program, module: &str, globals: &GlobalSyms) -> CheckOutcome {
@@ -158,6 +161,7 @@ pub fn check_program(prog: &Program, module: &str, globals: &GlobalSyms) -> Chec
         top_decls: HashMap::new(),
         // cli modules (loaded by `zap <command>`) run with build privileges
         val_writes_ok: module.starts_with("cli"),
+        pattern_depth: 0,
     };
     // module-level declarations first: union defs and types every fn sees
     for item in &prog.items {
@@ -792,6 +796,11 @@ impl Checker<'_> {
         match e {
             Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Null => {}
             Expr::Str(parts) => {
+                // route pattern args keep `{param}` literal — no interp
+                // name checks inside (§16.3)
+                if self.pattern_depth > 0 {
+                    return;
+                }
                 for p in parts {
                     if let StrPart::Interp(ie) = p {
                         self.walk(ie, false, module, fname);
@@ -819,8 +828,17 @@ impl Checker<'_> {
             Expr::Call { callee, args } => {
                 self.walk(callee, false, module, fname);
                 let move_args = Self::args_move(callee);
-                for a in args {
-                    self.walk(a, move_args, module, fname);
+                // route's pattern arg is literal (§16.3) — `{param}` is a
+                // path placeholder, not an interpolation
+                let is_route = matches!(callee.as_ref(), Expr::Ident(n) if n == "route");
+                for (i, a) in args.iter().enumerate() {
+                    if is_route && i == 0 {
+                        self.pattern_depth += 1;
+                        self.walk(a, false, module, fname);
+                        self.pattern_depth -= 1;
+                    } else {
+                        self.walk(a, move_args, module, fname);
+                    }
                 }
                 self.readinto_check(callee, args, module, fname);
                 self.method_borrow_check(callee, module, fname);
