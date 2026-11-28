@@ -520,7 +520,7 @@ unsafe fn refresh_root(root: &mut *mut ZUiC, refresh: ZRefreshCb) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zap_gui_run(root: *mut ZUiC, invoke: ZInvokeCb, refresh: ZRefreshCb, efficient: i32) -> i32 {
+pub unsafe extern "C" fn zap_gui_run(root: *mut ZUiC, invoke: ZInvokeCb, refresh: ZRefreshCb, efficient: i32, frame_ms: i32) -> i32 {
     #[cfg(unix)]
     {
         let Some(win) = (unsafe { root.as_ref() }) else { return 0 };
@@ -529,6 +529,12 @@ pub unsafe extern "C" fn zap_gui_run(root: *mut ZUiC, invoke: ZInvokeCb, refresh
             Ok(Some((mut xc, mut g))) => {
                 wayland::render(&mut xc, &mut g, root);
                 loop {
+                    // frameRate hard lock (§16.2): pace the non-blocking
+                    // pump to the configured frame interval; auto (0)
+                    // spins free at the display's production rate
+                    if frame_ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(frame_ms as u64));
+                    }
                     match wayland::events(&mut xc, &mut g) {
                         wayland::PumpResult::Close => break,
                         wayland::PumpResult::Events(clicked) => {
@@ -555,6 +561,9 @@ pub unsafe extern "C" fn zap_gui_run(root: *mut ZUiC, invoke: ZInvokeCb, refresh
             Ok(Some((mut xc, mut g))) => {
                 win32::render(&mut xc, &mut g, root);
                 loop {
+                    if frame_ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(frame_ms as u64));
+                    }
                     match win32::events(&mut xc, &mut g) {
                         win32::PumpResult::Close => break,
                         win32::PumpResult::Events(clicked) => {
@@ -576,7 +585,7 @@ pub unsafe extern "C" fn zap_gui_run(root: *mut ZUiC, invoke: ZInvokeCb, refresh
     #[cfg(not(any(unix, target_os = "windows")))]
     {
         // no native windowing on this target (wasi/web): headless
-        let _ = (root, invoke, refresh, efficient);
+        let _ = (root, invoke, refresh, efficient, frame_ms);
         0
     }
 }

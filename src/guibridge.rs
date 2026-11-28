@@ -291,7 +291,7 @@ unsafe extern "C" fn host_invoke(fv: *const ZValC) {
 /// `vm` is the live interpreter — passed as a raw pointer because the
 /// renderer re-enters it from click handlers while `ui.run` is on the
 /// stack (single-threaded; the outer borrow is suspended, not aliased).
-pub fn run(win: &Arc<Mutex<UiElement>>, vm: *mut Vm, efficient: bool) -> i32 {
+pub fn run(win: &Arc<Mutex<UiElement>>, vm: *mut Vm, efficient: bool, frame_ms: u32) -> i32 {
     unsafe {
         HOST_VM = vm;
         HOST_EL.with(|c| *c.borrow_mut() = Some(win.clone()));
@@ -304,12 +304,12 @@ pub fn run(win: &Arc<Mutex<UiElement>>, vm: *mut Vm, efficient: bool) -> i32 {
             // drive zap_gui_feed/zap_gui_step from the browser event
             // loop. The marshalled tree and HOST_VM stay alive for the
             // life of the page, intentionally not freed.
-            let _ = zapgui::zap_gui_attach(LAST_TREE, cb, rcb, 800, 600, efficient as i32);
+            let _ = zapgui::zap_gui_attach(LAST_TREE, cb, rcb, 800, 600, efficient as i32, frame_ms as i32);
             return 1;
         }
         #[cfg(not(target_os = "wasi"))]
         {
-            let r = zap_gui_run(LAST_TREE, cb, rcb, efficient as i32);
+            let r = zap_gui_run(LAST_TREE, cb, rcb, efficient as i32, frame_ms as i32);
             free_zui(LAST_TREE);
             LAST_TREE = std::ptr::null_mut();
             HOST_EL.with(|c| *c.borrow_mut() = None);

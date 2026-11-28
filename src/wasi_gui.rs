@@ -18,6 +18,10 @@ struct WasiGui {
     invoke: ZInvokeCb,
     refresh: ZRefreshCb,
     efficient: bool,
+    /// frameRate hard lock (§16.2): 0 = auto (every rAF step renders)
+    frame_ms: u32,
+    /// last frame production time, for the hard lock
+    last_frame: Option<std::time::Instant>,
     g: Gui,
     prev: Vec<u32>,
     events: Vec<(i32, i32, i32)>,
@@ -80,6 +84,7 @@ pub unsafe extern "C" fn zap_gui_attach(
     w: i32,
     h: i32,
     efficient: i32,
+    frame_ms: i32,
 ) -> i32 {
     unsafe {
         if root.is_null() || (*SHARED.0.get()).is_some() {
@@ -91,6 +96,8 @@ pub unsafe extern "C" fn zap_gui_attach(
             invoke,
             refresh,
             efficient: efficient != 0,
+            frame_ms: frame_ms.max(0) as u32,
+            last_frame: None,
             g: Gui {
                 fb_w: w,
                 fb_h: h,
@@ -135,6 +142,18 @@ pub extern "C" fn zap_gui_step() -> i32 {
             return 0;
         }
         let st = wg();
+        // frameRate hard lock (§16.2): rAF may tick faster than the lock —
+        // skip steps until the configured interval has passed
+        if st.frame_ms > 0 {
+            let due = st
+                .last_frame
+                .map(|t| t.elapsed().as_millis() >= st.frame_ms as u128)
+                .unwrap_or(true);
+            if !due {
+                return 0;
+            }
+            st.last_frame = Some(std::time::Instant::now());
+        }
         if st.events.is_empty() && !st.pending {
             return 0;
         }

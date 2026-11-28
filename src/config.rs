@@ -60,6 +60,18 @@ pub struct Config {
     pub cli: Vec<String>,
 }
 
+/// §16.2 frameRate: `auto` (default) → 0 = the renderer mirrors the
+/// display's actual frame production; a number → the milliseconds between
+/// frames of a hard lock (1000 / fps).
+pub fn frame_ms_of(fr: &Option<YVal>) -> u32 {
+    let n = match fr {
+        Some(YVal::Int(n)) if *n > 0 => Some(*n),
+        Some(YVal::Str(s)) => s.trim().parse::<i64>().ok().filter(|n| *n > 0),
+        _ => None,
+    };
+    n.map(|n| (1000 / n).max(1) as u32).unwrap_or(0)
+}
+
 const KNOWN_KEYS: &[&str] = &[
     "name",
     "version",

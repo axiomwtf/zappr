@@ -2655,7 +2655,13 @@ impl Vm {
                         .as_ref()
                         .map(|p| p.config.efficient_redraw)
                         .unwrap_or(false);
-                    crate::guibridge::run(&w, self as *mut Vm, eff);
+                    let frame_ms = self
+                        .prog
+                        .project
+                        .as_ref()
+                        .map(|p| crate::config::frame_ms_of(&p.config.frame_rate))
+                        .unwrap_or(0);
+                    crate::guibridge::run(&w, self as *mut Vm, eff, frame_ms);
                     return Ok(Some(Value::Nothing));
                 }
                 // headless fallback only reachable without a window or on
