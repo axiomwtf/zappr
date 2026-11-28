@@ -54,6 +54,8 @@ pub struct CGen<'a> {
     loop_n: usize,
     /// loop break/continue label stack
     loop_labels: Vec<(String, String)>,
+    /// §15.1: for-in iteration hold vars currently in scope (released on return)
+    iter_holds: Vec<String>,
     /// declared names in the fn currently being emitted
     locals: HashSet<String>,
     cur_module: String,
@@ -87,6 +89,7 @@ pub fn emit(project: &Project, reachable: &HashSet<String>) -> Result<String, St
         tmp_n: 0,
         loop_n: 0,
         loop_labels: Vec::new(),
+        iter_holds: Vec::new(),
         locals: HashSet::new(),
         cur_module: String::new(),
         cur_fn_q: String::new(),
@@ -223,6 +226,7 @@ impl<'a> CGen<'a> {
         let fname = mangled(qname);
         self.locals.clear();
         self.loop_labels.clear();
+        self.iter_holds.clear();
         self.tmp_n = 0;
         self.loop_n = 0;
         collect_decl_names(body, &mut self.locals);
@@ -446,7 +450,18 @@ impl<'a> CGen<'a> {
             Stmt::Return(e) => {
                 let ex = self.emit_expr(e);
                 self.ind(s, ind);
-                let _ = writeln!(s, "{{ z_ret = {ex}; goto z_done; }}");
+                // §15.1: returning exits every enclosing for-in — release
+                // their iteration holds or the cells stay read-locked
+                if self.iter_holds.is_empty() {
+                    let _ = writeln!(s, "{{ z_ret = {ex}; goto z_done; }}");
+                } else {
+                    let frees: String = self
+                        .iter_holds
+                        .iter()
+                        .map(|h| format!("z_iter_free({h}); "))
+                        .collect();
+                    let _ = writeln!(s, "{{ {frees}z_ret = {ex}; goto z_done; }}");
+                }
             }
             Stmt::Parallel { body, .. } => {
                 // structured concurrency (§14): each top-level stmt is a
@@ -458,6 +473,10 @@ impl<'a> CGen<'a> {
                 self.par_seq += body.len();
                 self.ind(s, ind);
                 let _ = writeln!(s, "{{ ZEnv *{penv} = env;");
+                // §15.1: parent bindings are reachable from every branch
+                // thread — guard their cells before spawning
+                self.ind(s, ind + 1);
+                let _ = writeln!(s, "z_escape_env({penv}, 0);");
                 // spawn all children first, then join — true concurrency
                 for (i, _) in body.iter().enumerate() {
                     let zc = self.tmp("zc");
@@ -604,9 +623,14 @@ impl<'a> CGen<'a> {
         ];
 
         let mut first = true;
-        for (cond, setup, header, bindval) in branches {
+        for (bi, (cond, setup, header, bindval)) in branches.into_iter().enumerate() {
             self.loop_n += 1;
             let (bl, cl) = (format!("zb{}", self.loop_n), format!("zc{}", self.loop_n));
+            // §15.1: iterating a guarded collection holds a read borrow for
+            // the loop's duration; break must land before the release
+            let holdable = bi <= 1; // list/tuple and map branches
+            let hv = if holdable { Some(self.tmp("ih")) } else { None };
+            let bl_eff = if hv.is_some() { format!("{bl}x") } else { bl.clone() };
             self.ind(s, ind + 1);
             let kw = if first { "if" } else { "else if" };
             let _ = writeln!(s, "{kw} ({cond}) {{");
@@ -614,6 +638,10 @@ impl<'a> CGen<'a> {
             for line in &setup {
                 self.ind(s, ind + 2);
                 let _ = writeln!(s, "{line}");
+            }
+            if let Some(h) = &hv {
+                self.ind(s, ind + 2);
+                let _ = writeln!(s, "void *{h} = z_iter_hold({iv}, \"for..in iteration\");");
             }
             self.ind(s, ind + 2);
             let _ = writeln!(s, "{header}");
@@ -639,15 +667,28 @@ impl<'a> CGen<'a> {
             } else {
                 self.emit_for_bind(s, pat, &bindval, ind + 3);
             }
-            self.loop_labels.push((bl.clone(), cl.clone()));
+            self.loop_labels.push((bl_eff.clone(), cl.clone()));
+            if let Some(h) = &hv {
+                self.iter_holds.push(h.clone());
+            }
             for st in body {
                 self.emit_stmt(s, st, ind + 3);
+            }
+            if hv.is_some() {
+                self.iter_holds.pop();
             }
             self.loop_labels.pop();
             self.ind(s, ind + 3);
             let _ = writeln!(s, "{cl}: ;");
             self.ind(s, ind + 2);
             s.push_str("}\n");
+            if let Some(h) = &hv {
+                // break target: release the hold, then continue past loop
+                self.ind(s, ind + 2);
+                let _ = writeln!(s, "{bl_eff}: ;");
+                self.ind(s, ind + 2);
+                let _ = writeln!(s, "z_iter_free({h});");
+            }
             self.ind(s, ind + 2);
             let _ = writeln!(s, "{bl}: ;");
             self.ind(s, ind + 1);
@@ -1127,12 +1168,14 @@ impl<'a> CGen<'a> {
         s.push_str("  ZVal z_ret = ZNOTHING;\n");
         let saved_locals = std::mem::take(&mut self.locals);
         let saved_labels = std::mem::take(&mut self.loop_labels);
+        let saved_holds = std::mem::take(&mut self.iter_holds);
         let saved_tmp = self.tmp_n;
         let saved_loop = self.loop_n;
         let saved_cur = self.cur_fn_q.clone();
         self.locals = ["args".to_string()].into_iter().collect();
         collect_decl_names(std::slice::from_ref(st), &mut self.locals);
         self.loop_labels = Vec::new();
+        self.iter_holds = Vec::new();
         self.tmp_n = 0;
         self.loop_n = 0;
         self.cur_fn_q = format!("parallel{lid}");
@@ -1145,6 +1188,7 @@ impl<'a> CGen<'a> {
         self.par_defs.push_str(&s);
         self.locals = saved_locals;
         self.loop_labels = saved_labels;
+        self.iter_holds = saved_holds;
         self.tmp_n = saved_tmp;
         self.loop_n = saved_loop;
         self.cur_fn_q = saved_cur;
@@ -1163,12 +1207,14 @@ impl<'a> CGen<'a> {
         s.push_str("  { ZVec *_r = z_vec_new(); for (int _i = 1; _i < nargs; _i++) z_vec_push(_r, args[_i]); z_env_define(env, \"args\", z_args_record(supplied, _r, 1)); }\n");
         let saved_locals = std::mem::take(&mut self.locals);
         let saved_labels = std::mem::take(&mut self.loop_labels);
+        let saved_holds = std::mem::take(&mut self.iter_holds);
         let saved_tmp = self.tmp_n;
         let saved_loop = self.loop_n;
         let saved_cur = self.cur_fn_q.clone();
         self.locals = ["event".to_string(), "args".to_string()].into_iter().collect();
         collect_decl_names(body, &mut self.locals);
         self.loop_labels = Vec::new();
+        self.iter_holds = Vec::new();
         self.tmp_n = 0;
         self.loop_n = 0;
         self.cur_fn_q = format!("lambda{lid}");
@@ -1179,6 +1225,7 @@ impl<'a> CGen<'a> {
         self.lambda_defs.push_str(&s);
         self.locals = saved_locals;
         self.loop_labels = saved_labels;
+        self.iter_holds = saved_holds;
         self.tmp_n = saved_tmp;
         self.loop_n = saved_loop;
         self.cur_fn_q = saved_cur;

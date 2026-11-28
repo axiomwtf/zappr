@@ -1,5 +1,7 @@
 //! Checker: names resolve, arity is soft-checked, poison paths linted,
-//! naming law + no-shadowing enforced (SPEC §4, §5, §9).
+//! naming law + no-shadowing enforced (SPEC §4, §5, §9), and the
+//! exclusivity law (§15.1): moves are compile-time and local, visible
+//! borrows are checked per-function.
 
 use crate::parser::{Expr, ForPat, Item, MatchArm, Program, Stmt, StrPart, TypeExpr};
 use std::collections::{HashMap, HashSet};
@@ -9,7 +11,31 @@ const AMBIENT: &[&str] = &[
     "print", "read", "readInto", "readDialogue", "assert", "typeof", "len", "str", "int",
     "float", "env", "clock", "nav", "ui", "route", "onClick", "weak", "channel", "spawn",
     "parallel", "zapYaml", "thisShell", "math", "json", "exit", "List", "Map", "null", "true",
-    "false", "int", "float", "str", "bool", "bytes", "Err", "poison", "any",
+    "false", "int", "float", "str", "bool", "bytes", "Err", "poison", "any", "args",
+];
+
+/// Bare builtins whose arguments are only read — never moved (§15.1).
+const BORROW_FNS: &[&str] = &[
+    "len", "str", "int", "float", "typeof", "assert", "weak", "exit", "read", "readDialogue",
+    "readInto", "Err", "channel", "route", "print",
+];
+
+/// `ns.fn` pairs whose arguments are only read.
+const BORROW_NS: &[&str] = &[
+    "env.get", "env.set", "nav.go", "thisShell.shellOut",
+];
+
+const BORROW_NS_PREFIX: &[&str] = &["print.", "env.", "clock.", "math.", "json.", "args."];
+
+/// Method names that mutate their receiver — a write access (§15.1).
+const MUTATING_METHODS: &[&str] = &[
+    "push", "pop", "reverse", "set", "insert", "remove", "delete", "clear", "send", "close",
+    "sort",
+];
+
+/// Scalar types whose values copy instead of move (§15.1, §7.1).
+const SCALAR_TYS: &[&str] = &[
+    "int", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "float", "f32", "f64", "bool",
 ];
 
 pub struct CheckOutcome {
@@ -58,18 +84,51 @@ impl GlobalSyms {
     }
 }
 
+/// An active borrow of a binding's storage — iteration holds one for the
+/// loop body so mutation of the iterated collection is an error (§15.1).
+struct Borrow {
+    root: String,
+    origin: String,
+}
+
+struct Checker<'a> {
+    errors: Vec<String>,
+    warnings: Vec<String>,
+    globals: &'a GlobalSyms,
+    /// lexical scopes; innermost last — name → copyable-scalar flag
+    scope: Vec<HashMap<String, bool>>,
+    /// bindings moved out of — dead until re-declared (§15.1)
+    moved: HashSet<String>,
+    /// live borrows of binding storage (iteration)
+    borrows: Vec<Borrow>,
+    /// names visible to an enclosing lambda/parallel body — shared, so
+    /// they cannot be moved out of (§15.1 escape hatch)
+    captured: HashSet<String>,
+}
+
 pub fn check_program(prog: &Program, module: &str, globals: &GlobalSyms) -> CheckOutcome {
     let mut c = Checker {
         errors: Vec::new(),
         warnings: Vec::new(),
         globals,
-        scope: vec![HashSet::new()],
+        scope: vec![HashMap::new()],
+        moved: HashSet::new(),
+        borrows: Vec::new(),
+        captured: HashSet::new(),
     };
     for item in &prog.items {
         if let Item::Fn { name, params, body, .. } = item {
-            c.scope = vec![HashSet::new()];
+            c.scope = vec![HashMap::new()];
+            c.moved.clear();
+            c.borrows.clear();
+            c.captured.clear();
             for p in params {
-                c.declare(&p.name);
+                let copyable = p
+                    .ty
+                    .as_ref()
+                    .map(|t| scalar_ty(t))
+                    .unwrap_or(false);
+                c.declare(&p.name, copyable);
             }
             c.stmts(body, module, name);
         }
@@ -80,20 +139,31 @@ pub fn check_program(prog: &Program, module: &str, globals: &GlobalSyms) -> Chec
     }
 }
 
-struct Checker<'a> {
-    errors: Vec<String>,
-    warnings: Vec<String>,
-    globals: &'a GlobalSyms,
-    /// lexical scopes; innermost last
-    scope: Vec<HashSet<String>>,
+fn scalar_ty(t: &TypeExpr) -> bool {
+    match t {
+        TypeExpr::Named(n) => SCALAR_TYS.contains(&n.as_str()),
+        _ => false,
+    }
+}
+
+/// Root binding an expression reads through field/cast chains — used to
+/// tell whether an access touches a borrowed binding's storage.
+fn root_ident(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Ident(n) => Some(n.clone()),
+        Expr::Field { obj, .. } => root_ident(obj),
+        Expr::Cast { expr, .. } => root_ident(expr),
+        Expr::CountOf(inner) => root_ident(inner),
+        _ => None,
+    }
 }
 
 impl Checker<'_> {
-    fn declare(&mut self, name: &str) -> bool {
+    fn declare(&mut self, name: &str, copyable: bool) -> bool {
         // no-shadowing law (§5.x): a decl in an inner scope that hides an
         // outer name is an error, not a warning
         for (i, s) in self.scope.iter().enumerate().rev() {
-            if s.contains(name) {
+            if s.contains_key(name) {
                 if i == self.scope.len() - 1 {
                     self.errors.push(format!(
                         "duplicate declaration `{name}` in same scope"
@@ -106,14 +176,143 @@ impl Checker<'_> {
                 return false;
             }
         }
-        self.scope.last_mut().unwrap().insert(name.to_string());
+        self.scope
+            .last_mut()
+            .unwrap()
+            .insert(name.to_string(), copyable);
         true
     }
 
     fn lookup(&self, name: &str) -> bool {
-        self.scope.iter().rev().any(|s| s.contains(name))
+        self.scope.iter().rev().any(|s| s.contains_key(name))
             || self.globals.names.contains(name)
             || AMBIENT.contains(&name)
+    }
+
+    /// Is `name` a local binding (not a global fn/type/ambient)?
+    fn is_local(&self, name: &str) -> bool {
+        self.scope.iter().rev().any(|s| s.contains_key(name))
+    }
+
+    fn copyable(&self, name: &str) -> bool {
+        self.scope
+            .iter()
+            .rev()
+            .find_map(|s| s.get(name).copied())
+            .unwrap_or(false)
+    }
+
+    /// Does this expression evaluate to a copyable scalar? (§15.1 —
+    /// scalars copy; everything else moves)
+    fn copyable_expr(&self, e: &Expr) -> bool {
+        match e {
+            Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Null => true,
+            Expr::Ident(n) => self.is_local(n) && self.copyable(n),
+            Expr::Unary { expr, .. } => self.copyable_expr(expr),
+            Expr::Cast { expr, ty } => scalar_ty(ty) || self.copyable_expr(expr),
+            _ => false,
+        }
+    }
+
+    /// Borrow-position use of a name: dead-binding check only.
+    fn borrow_ident(&mut self, name: &str, module: &str, fname: &str) {
+        if !self.lookup(name) {
+            self.errors.push(format!(
+                "unknown name `{name}` in {module}.{fname} — not a local, fn, type, module, or builtin"
+            ));
+            return;
+        }
+        if self.moved.contains(name) {
+            self.errors.push(format!(
+                "use of moved value `{name}` in {module}.{fname} — it was moved on a previous use (§15.1)"
+            ));
+        }
+    }
+
+    /// Move-position use of a name: dead check, borrow check, then kill
+    /// the binding unless the value copies (§15.1).
+    fn move_ident(&mut self, name: &str, module: &str, fname: &str) {
+        if !self.is_local(name) {
+            // globals, fns, types, ambient names are not movable bindings
+            if !self.lookup(name) {
+                self.errors.push(format!(
+                    "unknown name `{name}` in {module}.{fname} — not a local, fn, type, module, or builtin"
+                ));
+            }
+            return;
+        }
+        if self.moved.contains(name) {
+            self.errors.push(format!(
+                "use of moved value `{name}` in {module}.{fname} — it was moved on a previous use (§15.1)"
+            ));
+            return;
+        }
+        if let Some(b) = self.borrows.iter().find(|b| b.root == *name) {
+            self.errors.push(format!(
+                "cannot move `{name}` in {module}.{fname} — its storage is borrowed by {} (§15.1)",
+                b.origin
+            ));
+            return;
+        }
+        if self.copyable(name) || self.captured.contains(name) {
+            return;
+        }
+        self.moved.insert(name.to_string());
+    }
+
+    /// Run `f` with every currently-visible local treated as captured —
+    /// lambda bodies and parallel blocks share the enclosing scope, so
+    /// outer bindings cannot be moved out of them (§15.1).
+    fn with_captured<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let mut added = Vec::new();
+        for s in &self.scope {
+            for n in s.keys() {
+                if self.captured.insert(n.clone()) {
+                    added.push(n.clone());
+                }
+            }
+        }
+        let r = f(self);
+        for n in added {
+            self.captured.remove(&n);
+        }
+        r
+    }
+
+    /// Do call arguments move? Read-only builtins borrow; everything else
+    /// consumes (§15.1, §9.2).
+    fn args_move(callee: &Expr) -> bool {
+        match callee {
+            Expr::Ident(n) => {
+                if BORROW_FNS.contains(&n.as_str()) || n == "List" || n == "Map" {
+                    false
+                } else {
+                    true
+                }
+            }
+            Expr::Field { obj, name } => {
+                if let Expr::Ident(ns) = obj.as_ref() {
+                    let full = format!("{ns}.{name}");
+                    if BORROW_NS.contains(&full.as_str())
+                        || BORROW_NS_PREFIX.iter().any(|p| full.starts_with(p))
+                    {
+                        return false;
+                    }
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
+    /// Is this a write to a binding borrowed by an active iteration?
+    fn borrow_conflict(&mut self, root: &str, what: &str, module: &str, fname: &str) {
+        if let Some(b) = self.borrows.iter().find(|b| b.root == *root) {
+            self.errors.push(format!(
+                "exclusivity: {what} on `{root}` in {module}.{fname} while it is borrowed by {} — at most one writer or readers, never both (§15.1)",
+                b.origin
+            ));
+        }
     }
 
     fn stmts(&mut self, body: &[Stmt], module: &str, fname: &str) {
@@ -124,31 +323,57 @@ impl Checker<'_> {
 
     fn stmt(&mut self, s: &Stmt, module: &str, fname: &str) {
         match s {
-            Stmt::Decl { name, init, .. } => {
-                self.expr(init, module, fname);
-                self.declare(name);
+            Stmt::Decl {
+                name,
+                ty,
+                init,
+                ..
+            } => {
+                self.walk(init, true, module, fname);
+                let copyable = ty
+                    .as_ref()
+                    .map(|t| scalar_ty(t))
+                    .unwrap_or(false)
+                    || self.copyable_expr(init);
+                self.declare(name, copyable);
             }
             Stmt::DeclTuple { names, init, .. } => {
-                self.expr(init, module, fname);
+                self.walk(init, true, module, fname);
                 for n in names {
-                    self.declare(n);
+                    self.declare(n, false);
                 }
             }
-            Stmt::Reassign { target, value, .. } => {
+            Stmt::Reassign {
+                target, op, value, ..
+            } => {
                 if !self.lookup(target) {
                     self.errors.push(format!("`{target}` is not declared — use `!{target} =` to declare"));
                 }
                 if let Some(v) = value {
-                    self.expr(v, module, fname);
+                    self.walk(v, true, module, fname);
                 }
+                // any reassignment (set/inc/dec) writes the binding —
+                // conflicts with an active iteration borrow, and a moved
+                // binding is re-initialized (§15.1)
+                self.moved.remove(target);
+                if self.borrows.iter().any(|b| b.root == *target) {
+                    self.borrow_conflict(target, "reassignment", module, fname);
+                }
+                let _ = op;
             }
             Stmt::ReassignField { obj, value, .. } => {
                 if !self.lookup(obj) {
                     self.errors.push(format!("`{obj}` is not declared"));
                 }
-                self.expr(value, module, fname);
+                self.walk(value, true, module, fname);
+                self.borrow_conflict(obj, "field write", module, fname);
+                if self.moved.contains(obj) {
+                    self.errors.push(format!(
+                        "use of moved value `{obj}` in {module}.{fname} — it was moved on a previous use (§15.1)"
+                    ));
+                }
             }
-            Stmt::Expr(e) => self.expr(e, module, fname),
+            Stmt::Expr(e) => self.walk(e, false, module, fname),
             Stmt::If {
                 cond,
                 bind,
@@ -157,149 +382,215 @@ impl Checker<'_> {
                 else_bind,
                 ..
             } => {
-                self.expr(cond, module, fname);
-                self.scope.push(HashSet::new());
+                // `if e as u` moves the bound value; a bare condition borrows
+                let bound = bind.is_some() || else_bind.is_some();
+                self.walk(cond, bound, module, fname);
+                self.scope.push(HashMap::new());
                 if let Some(b) = bind {
-                    self.declare(b);
+                    let cp = self.copyable_expr(cond);
+                    self.declare(b, cp);
                 }
                 self.stmts(then_body, module, fname);
                 self.scope.pop();
                 if let Some(eb) = else_body {
-                    self.scope.push(HashSet::new());
+                    self.scope.push(HashMap::new());
                     if let Some(b) = else_bind {
-                        self.declare(b);
+                        let cp = self.copyable_expr(cond);
+                        self.declare(b, cp);
                     }
                     self.stmts(eb, module, fname);
                     self.scope.pop();
                 }
             }
             Stmt::ForIn { pat, iter, body, .. } => {
-                self.expr(iter, module, fname);
-                self.scope.push(HashSet::new());
+                self.walk(iter, false, module, fname);
+                // iteration borrows the collection's storage for the body —
+                // mutating it inside is an exclusivity error (§15.1)
+                let root = root_ident(iter);
+                if let Some(r) = &root {
+                    self.borrows.push(Borrow {
+                        root: r.clone(),
+                        origin: format!("for..in `{r}`"),
+                    });
+                }
+                self.scope.push(HashMap::new());
                 match pat {
                     ForPat::Single(n) => {
-                        self.declare(n);
+                        self.declare(n, false);
                     }
                     ForPat::Tuple(ns) => {
                         for n in ns {
-                            self.declare(n);
+                            self.declare(n, false);
                         }
                     }
                 }
                 self.stmts(body, module, fname);
                 self.scope.pop();
+                if root.is_some() {
+                    self.borrows.pop();
+                }
             }
             Stmt::ForCond { cond, body, .. } => {
-                self.expr(cond, module, fname);
-                self.scope.push(HashSet::new());
+                self.walk(cond, false, module, fname);
+                self.scope.push(HashMap::new());
                 self.stmts(body, module, fname);
                 self.scope.pop();
             }
             Stmt::ForInfinite { body, .. } => {
-                self.scope.push(HashSet::new());
+                self.scope.push(HashMap::new());
                 self.stmts(body, module, fname);
                 self.scope.pop();
             }
             Stmt::ForCStyle { init, cond, post, body, .. } => {
-                self.scope.push(HashSet::new());
+                self.scope.push(HashMap::new());
                 for s in init {
                     self.stmt(s, module, fname);
                 }
-                self.expr(cond, module, fname);
+                self.walk(cond, false, module, fname);
                 for s in post {
                     self.stmt(s, module, fname);
                 }
-                self.scope.push(HashSet::new());
+                self.scope.push(HashMap::new());
                 self.stmts(body, module, fname);
                 self.scope.pop();
                 self.scope.pop();
             }
             Stmt::Match { expr, arms, .. } => {
-                self.expr(expr, module, fname);
+                self.walk(expr, false, module, fname);
                 for arm in arms {
                     self.match_arm(arm, module, fname);
                 }
             }
-            Stmt::Return(e) => self.expr(e, module, fname),
+            Stmt::Return(e) => self.walk(e, true, module, fname),
             Stmt::Parallel { body, .. } => {
-                // parallel body shares the enclosing scope for decls (§14:
-                // declarations publish upward) — check in a child scope so
-                // names still resolve, but don't double-declare
-                self.scope.push(HashSet::new());
-                self.stmts(body, module, fname);
-                self.scope.pop();
+                // parallel children share the enclosing scope — outer names
+                // are captured, not movable (§14, §15.1)
+                self.with_captured(|c| {
+                    c.scope.push(HashMap::new());
+                    c.stmts(body, module, fname);
+                    c.scope.pop();
+                });
             }
-            Stmt::Spawn(e) => self.expr(e, module, fname),
+            Stmt::Spawn(e) => self.walk(e, true, module, fname),
             Stmt::Break | Stmt::Continue | Stmt::Use(_) => {}
         }
     }
 
     fn match_arm(&mut self, arm: &MatchArm, module: &str, fname: &str) {
-        self.scope.push(HashSet::new());
+        self.scope.push(HashMap::new());
         if let Some(b) = &arm.bind {
-            self.declare(b);
+            self.declare(b, false);
         }
         self.stmts(&arm.body, module, fname);
         self.scope.pop();
     }
 
-    fn expr(&mut self, e: &Expr, module: &str, fname: &str) {
+    /// `move_here`: this expression's root value flows into a new owner.
+    /// Only matters at Ident leaves — every other position decides for
+    /// itself (§15.1).
+    fn walk(&mut self, e: &Expr, move_here: bool, module: &str, fname: &str) {
         match e {
             Expr::Int(_) | Expr::Float(_) | Expr::Bool(_) | Expr::Null => {}
             Expr::Str(parts) => {
                 for p in parts {
                     if let StrPart::Interp(ie) = p {
-                        self.expr(ie, module, fname);
+                        self.walk(ie, false, module, fname);
                     }
                 }
             }
             Expr::Ident(name) => {
-                if !self.lookup(name) {
-                    self.errors.push(format!(
-                        "unknown name `{name}` in {module}.{fname} — not a local, fn, type, module, or builtin"
-                    ));
+                if move_here {
+                    self.move_ident(name, module, fname);
+                } else {
+                    self.borrow_ident(name, module, fname);
                 }
             }
             Expr::Tuple(es) | Expr::List(es) => {
                 for e in es {
-                    self.expr(e, module, fname);
+                    self.walk(e, true, module, fname);
                 }
             }
             Expr::Map(kvs) => {
                 for (k, v) in kvs {
-                    self.expr(k, module, fname);
-                    self.expr(v, module, fname);
+                    self.walk(k, true, module, fname);
+                    self.walk(v, true, module, fname);
                 }
             }
             Expr::Call { callee, args } => {
-                self.expr(callee, module, fname);
+                self.walk(callee, false, module, fname);
+                let move_args = Self::args_move(callee);
                 for a in args {
-                    self.expr(a, module, fname);
+                    self.walk(a, move_args, module, fname);
                 }
+                self.readinto_check(callee, args, module, fname);
+                self.method_borrow_check(callee, module, fname);
                 self.arity_check(callee, args, module, fname);
             }
-            Expr::Field { obj, .. } => self.expr(obj, module, fname),
-            Expr::Unary { expr, .. } => self.expr(expr, module, fname),
+            Expr::Field { obj, .. } => self.walk(obj, false, module, fname),
+            Expr::Unary { expr, .. } => self.walk(expr, false, module, fname),
             Expr::Binary { l, r, .. } => {
-                self.expr(l, module, fname);
-                self.expr(r, module, fname);
+                self.walk(l, false, module, fname);
+                self.walk(r, false, module, fname);
             }
-            Expr::Cast { expr, .. } => self.expr(expr, module, fname),
-            Expr::CountOf(inner) => self.expr(inner, module, fname),
-            Expr::DeclArg { var, .. } => {
-                self.declare(var);
+            Expr::Cast { expr, .. } => self.walk(expr, false, module, fname),
+            Expr::CountOf(inner) => self.walk(inner, false, module, fname),
+            Expr::DeclArg { ty, var } => {
+                self.declare(var, scalar_ty(&TypeExpr::Named(ty.clone())));
             }
-            Expr::NamedArg { value, .. } => self.expr(value, module, fname),
+            Expr::NamedArg { value, .. } => self.walk(value, true, module, fname),
             Expr::RecordType { fields } => {
                 for (_, t) in fields {
                     self.type_expr(t);
                 }
             }
             Expr::Callback { call, body } => {
-                self.expr(call, module, fname);
-                self.scope.push(HashSet::new());
-                self.stmts(body, module, fname);
-                self.scope.pop();
+                if let Expr::Call { callee, args } = call.as_ref() {
+                    self.walk(callee, false, module, fname);
+                    let move_args = Self::args_move(callee);
+                    for a in args {
+                        self.walk(a, move_args, module, fname);
+                    }
+                    self.readinto_check(callee, args, module, fname);
+                    self.method_borrow_check(callee, module, fname);
+                    self.arity_check(callee, args, module, fname);
+                    self.with_captured(|c| {
+                        c.scope.push(HashMap::new());
+                        c.stmts(body, module, fname);
+                        c.scope.pop();
+                    });
+                } else {
+                    self.walk(call, false, module, fname);
+                }
+            }
+        }
+    }
+
+    /// `readInto(x)` writes the binding — a borrowed root conflicts, and a
+    /// moved binding is re-initialized (§9.4, §15.1).
+    fn readinto_check(&mut self, callee: &Expr, args: &[Expr], module: &str, fname: &str) {
+        if let Expr::Ident(n) = callee {
+            if n == "readInto" {
+                if let Some(Expr::Ident(var)) = args.first() {
+                    if self.borrows.iter().any(|b| b.root == *var) {
+                        self.borrow_conflict(var, "readInto", module, fname);
+                    }
+                    self.moved.remove(var);
+                }
+            }
+        }
+    }
+
+    /// `recv.mutatingMethod(...)` while `recv`'s root is iteration-borrowed
+    /// is an exclusivity error (§15.1).
+    fn method_borrow_check(&mut self, callee: &Expr, module: &str, fname: &str) {
+        if let Expr::Field { obj, name } = callee {
+            if !MUTATING_METHODS.contains(&name.as_str()) {
+                return;
+            }
+            if let Some(root) = root_ident(obj) {
+                if self.borrows.iter().any(|b| b.root == root) {
+                    self.borrow_conflict(&root, &format!("method `.{name}`"), module, fname);
+                }
             }
         }
     }

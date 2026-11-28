@@ -8,7 +8,7 @@ use crate::parser::{
 use crate::value::{values_equal, BuiltinFn, ChannelState, ErrVal, FuncVal, Num, PoisonKind, TypeRepr, Value};
 use crate::value::Env as Scope;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 #[derive(Debug)]
@@ -49,6 +49,59 @@ pub struct Vm {
     /// owning project (set by vm_for) — lets ui.run hand off to the
     /// compiled native renderer (§16)
     pub project: Option<std::sync::Arc<crate::project::Project>>,
+    /// §15.1 runtime exclusivity guard: per-cell access flags for borrows
+    /// that escaped the checker's sight (closures, stored fields, tasks)
+    access: Rc<RefCell<AccessInner>>,
+}
+
+/// Live access state for one guarded cell (§15.1).
+#[derive(Default)]
+struct Access {
+    readers: u32,
+    writer: bool,
+    ro: String,
+    wo: String,
+}
+
+#[derive(Default)]
+struct AccessInner {
+    /// cells marked as escaped — only these carry the access flag
+    guarded: HashSet<usize>,
+    /// currently-held accesses, keyed by cell
+    active: HashMap<usize, Access>,
+}
+
+/// RAII access permit — releases the cell's read/write slot on drop.
+struct AccessPermit {
+    inner: Rc<RefCell<AccessInner>>,
+    key: usize,
+    write: bool,
+    armed: bool,
+}
+
+impl AccessPermit {
+    fn disarmed() -> Self {
+        AccessPermit { inner: Rc::new(RefCell::new(AccessInner::default())), key: 0, write: false, armed: false }
+    }
+}
+
+impl Drop for AccessPermit {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut g = self.inner.borrow_mut();
+        if let Some(a) = g.active.get_mut(&self.key) {
+            if self.write {
+                a.writer = false;
+            } else {
+                a.readers = a.readers.saturating_sub(1);
+            }
+            if a.readers == 0 && !a.writer {
+                g.active.remove(&self.key);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -82,6 +135,7 @@ impl Vm {
             cur_line: 0,
             cli_args: Vec::new(),
             project: None,
+            access: Rc::new(RefCell::new(AccessInner::default())),
         }
     }
 
@@ -105,20 +159,29 @@ impl Vm {
                 });
             }
         }
-        self.scopes
-            .last()
-            .unwrap()
-            .borrow_mut()
-            .insert(name.to_string(), val);
+        let scope = self.scopes.last().unwrap().clone();
+        let _p = self
+            .enter_scope(&scope, true, &format!("declare `{name}`"))
+            .map_err(|m| RuntimeError { msg: m, line: self.cur_line })?;
+        self.escape_value(&val);
+        scope.borrow_mut().insert(name.to_string(), val);
         Ok(())
     }
 
     fn set(&mut self, name: &str, val: Value) -> Result<(), RuntimeError> {
-        for s in self.scopes.iter().rev() {
-            if s.borrow().contains_key(name) {
-                s.borrow_mut().insert(name.to_string(), val);
-                return Ok(());
-            }
+        let found = self
+            .scopes
+            .iter()
+            .rev()
+            .find(|s| s.borrow().contains_key(name))
+            .cloned();
+        if let Some(s) = found {
+            let _p = self
+                .enter_scope(&s, true, &format!("assign `{name}`"))
+                .map_err(|m| RuntimeError { msg: m, line: self.cur_line })?;
+            self.escape_value(&val);
+            s.borrow_mut().insert(name.to_string(), val);
+            return Ok(());
         }
         Err(RuntimeError {
             msg: format!("reassignment of undeclared `{name}` — use `!{name} = ...` to declare"),
@@ -128,11 +191,207 @@ impl Vm {
 
     fn get(&self, name: &str) -> Option<Value> {
         for s in self.scopes.iter().rev() {
+            let _p = match self.enter_scope(s, false, "binding read") {
+                Ok(p) => p,
+                Err(m) => {
+                    return Some(Value::Poison {
+                        kind: PoisonKind::ExclusiveAccess,
+                        origin: m,
+                        expected: "read access".into(),
+                        actual: "conflicting access".into(),
+                    })
+                }
+            };
             if let Some(v) = s.borrow().get(name) {
                 return Some(v.clone());
             }
         }
         None
+    }
+
+    // ---------- §15.1 exclusivity guard ----------
+
+    fn cell_key<T>(rc: &Rc<RefCell<T>>) -> usize {
+        Rc::as_ptr(rc) as usize
+    }
+
+    /// Identity of a shared value's storage cell, if it has one.
+    fn value_key(v: &Value) -> Option<usize> {
+        match v {
+            Value::Tuple(t) => Some(Self::cell_key(t)),
+            Value::List(l) => Some(Self::cell_key(l)),
+            Value::Map(m) => Some(Self::cell_key(m)),
+            Value::Record { fields, .. } => Some(Self::cell_key(fields)),
+            Value::Channel(c) => Some(Self::cell_key(c)),
+            Value::Ui(u) => Some(Self::cell_key(u)),
+            _ => None,
+        }
+    }
+
+    /// Cells shared by construction — always carry the flag.
+    fn always_guarded(v: &Value) -> bool {
+        matches!(v, Value::Channel(_) | Value::Ui(_))
+    }
+
+    /// Acquire a read (`write=false`) or write access on a value's cell.
+    /// Unguarded cells cost one hash lookup and no tracking (§15.1: the
+    /// flag is only carried where borrows escape the checker).
+    fn enter_val(&self, v: &Value, write: bool, origin: &str) -> Result<AccessPermit, String> {
+        let Some(key) = Self::value_key(v) else {
+            return Ok(AccessPermit::disarmed());
+        };
+        self.access_enter(key, Self::always_guarded(v), write, origin)
+    }
+
+    fn enter_scope(
+        &self,
+        scope: &Rc<RefCell<HashMap<String, Value>>>,
+        write: bool,
+        origin: &str,
+    ) -> Result<AccessPermit, String> {
+        self.access_enter(Self::cell_key(scope), false, write, origin)
+    }
+
+    fn access_enter(
+        &self,
+        key: usize,
+        always: bool,
+        write: bool,
+        origin: &str,
+    ) -> Result<AccessPermit, String> {
+        let inner = self.access.clone();
+        let armed = {
+            let mut g = inner.borrow_mut();
+            if !(always || g.guarded.contains(&key)) {
+                false
+            } else {
+                let a = g.active.entry(key).or_default();
+                if write {
+                    if a.readers > 0 || a.writer {
+                        let other = if a.writer {
+                            format!("write `{}`", a.wo)
+                        } else {
+                            format!("{} read(s) by `{}`", a.readers, a.ro)
+                        };
+                        return Err(format!(
+                            "exclusiveAccess: write `{origin}` conflicts with {other} — at most one writer or readers, never both (§15.1)"
+                        ));
+                    }
+                    a.writer = true;
+                    a.wo = origin.to_string();
+                } else {
+                    if a.writer {
+                        return Err(format!(
+                            "exclusiveAccess: read `{origin}` conflicts with write `{}` (§15.1)",
+                            a.wo
+                        ));
+                    }
+                    a.readers += 1;
+                    if a.readers == 1 {
+                        a.ro = origin.to_string();
+                    }
+                }
+                true
+            }
+        };
+        Ok(AccessPermit { inner, key, write, armed })
+    }
+
+    /// Mark a value's storage (and everything reachable through it) as
+    /// escaped — it now carries the per-object access flag (§15.1).
+    fn escape_value(&self, v: &Value) {
+        let mut seen = HashSet::new();
+        self.escape_value_seen(v, &mut seen);
+    }
+
+    fn escape_value_seen(&self, v: &Value, seen: &mut HashSet<usize>) {
+        // values whose sharing lives outside their own cell
+        match v {
+            Value::Func(f) => {
+                let id = Rc::as_ptr(f) as usize;
+                if seen.insert(id) {
+                    self.escape_env_seen(&f.env, seen);
+                }
+                return;
+            }
+            Value::Weak(w) => {
+                let inner = w.borrow().clone();
+                self.escape_value_seen(&inner, seen);
+                return;
+            }
+            Value::Variant { inner, .. } => {
+                self.escape_value_seen(inner, seen);
+                return;
+            }
+            _ => {}
+        }
+        let Some(key) = Self::value_key(v) else { return };
+        if !seen.insert(key) {
+            return;
+        }
+        {
+            let mut g = self.access.borrow_mut();
+            if !g.guarded.insert(key) {
+                return; // already escaped — children were covered then
+            }
+        }
+        // newly guarded: cover nested storage so deep escapes are seen
+        match v {
+            Value::Tuple(t) => {
+                for x in t.borrow().iter() {
+                    self.escape_value_seen(x, seen);
+                }
+            }
+            Value::List(l) => {
+                for x in l.borrow().iter() {
+                    self.escape_value_seen(x, seen);
+                }
+            }
+            Value::Map(m) => {
+                for (k, x) in m.borrow().iter() {
+                    self.escape_value_seen(k, seen);
+                    self.escape_value_seen(x, seen);
+                }
+            }
+            Value::Record { fields, .. } => {
+                for (_, x) in fields.borrow().iter() {
+                    self.escape_value_seen(x, seen);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Escape every binding visible in an environment — used when a
+    /// closure or task captures scopes (§15.1). A scope already guarded
+    /// had its contents covered when it was marked; new bindings escape
+    /// themselves at declare/set time.
+    fn escape_env(&self, env: &Scope) {
+        let mut seen = HashSet::new();
+        self.escape_env_seen(env, &mut seen);
+    }
+
+    fn escape_env_seen(&self, env: &Scope, seen: &mut HashSet<usize>) {
+        for scope in env {
+            let key = Self::cell_key(scope);
+            if !seen.insert(key) {
+                continue;
+            }
+            let fresh = {
+                let mut g = self.access.borrow_mut();
+                g.guarded.insert(key)
+            };
+            if !fresh {
+                continue; // already escaped — its bindings covered then
+            }
+            for (_, v) in scope.borrow().iter() {
+                self.escape_value_seen(v, seen);
+            }
+        }
+    }
+
+    fn escape_scopes(&self) {
+        self.escape_env(&self.scopes);
     }
 
     // ---------- loading ----------
@@ -500,6 +759,15 @@ impl Vm {
                     return Ok(Flow::Normal);
                 }
                 // iterate lists/tuples/maps/channels
+                // §15.1: the iteration holds a read access on the
+                // collection — a write inside the body fails loudly
+                let _iter_guard = match &it {
+                    Value::List(_) | Value::Tuple(_) | Value::Map(_) => Some(
+                        self.enter_val(&it, false, "for..in iteration")
+                            .map_err(|m| RuntimeError { msg: m, line: *line })?,
+                    ),
+                    _ => None,
+                };
                 let mut idx = 0usize;
                 loop {
                     let next = match &it {
@@ -667,6 +935,7 @@ impl Vm {
             }
             Stmt::Parallel { body, line } => {
                 self.cur_line = *line;
+                self.escape_scopes();
                 // v1: structured concurrency semantics — children run to
                 // completion at the join, decls publish upward. Parallel
                 // execution lands with native codegen; the join guarantee
@@ -676,6 +945,7 @@ impl Vm {
                 // publish decls upward
                 let inner = self.scopes.pop().unwrap();
                 for (k, v) in inner.borrow().iter() {
+                    self.escape_value(v);
                     self.scopes
                         .last()
                         .unwrap()
@@ -793,6 +1063,8 @@ impl Vm {
     }
 
     fn field_set(&self, obj: &Value, field: &str, val: Value) -> Result<(), String> {
+        let _p = self.enter_val(obj, true, &format!("write `.{field}`"))?;
+        self.escape_value(&val);
         match obj {
             Value::Ui(el) => {
                 // mutate an element's property and it updates (§16.1)
@@ -927,7 +1199,9 @@ impl Vm {
                     for a in args {
                         vals.push(self.eval(a)?);
                     }
-                    // register the lambda as a fn capturing current scopes
+                    // register the lambda as a fn capturing current scopes —
+                    // captured bindings escape the checker's sight (§15.1)
+                    self.escape_scopes();
                     let id = self.fns.len();
                     self.fns.push(FnDef {
                         name: "<lambda>".into(),
@@ -1024,6 +1298,9 @@ impl Vm {
     }
 
     fn field_get(&mut self, obj: &Value, name: &str) -> Result<Value, RuntimeError> {
+        let _p = self
+            .enter_val(obj, false, &format!("read `.{name}`"))
+            .map_err(|m| RuntimeError { msg: m, line: self.cur_line })?;
         obj.ensure_not_poison(&format!(".{name}"))
             .map_err(|m| RuntimeError {
                 msg: m,
@@ -1418,6 +1695,9 @@ impl Vm {
             for a in args {
                 vals.push(self.eval(a)?);
             }
+            for v in &vals {
+                self.escape_value(v);
+            }
             return self.eval_callee(callee, vals, vec![]);
         }
         self.err("spawn expects a call".into())
@@ -1475,6 +1755,12 @@ impl Vm {
                 {
                     if add_name == "add" {
                         let parent = self.eval(add_obj)?;
+                        for a in &args {
+                            self.escape_value(a);
+                        }
+                        let _pp = self
+                            .enter_val(&parent, true, "ui element store")
+                            .map_err(|m| RuntimeError { msg: m, line: self.cur_line })?;
                         return Ok(crate::uiruntime::UiRuntime::add_element(
                             &parent, name, &args,
                         ));
@@ -1664,9 +1950,22 @@ impl Vm {
         if name == "fnType" {
             return self.fn_type_check(obj, args);
         }
+        // §15.1: mutating methods take a write access; the rest read.
+        // map/filter hold the read across user callbacks — a mutating
+        // callback on the same cell fails as exclusiveAccess.
+        let write = matches!(
+            (obj, name),
+            (Value::List(_), "push" | "pop" | "reverse")
+                | (Value::Map(_), "set")
+                | (Value::Channel(_), "send" | "close")
+        );
+        let _p = self
+            .enter_val(obj, write, &format!("method `.{name}`"))
+            .map_err(|m| RuntimeError { msg: m, line: self.cur_line })?;
         match (obj, name) {
             (Value::List(l), "push") => {
                 if let Some(v) = args.first() {
+                    self.escape_value(v);
                     l.borrow_mut().push(v.clone());
                 }
                 Ok(Value::Nothing)
@@ -1728,6 +2027,8 @@ impl Vm {
                 if args.len() >= 2 {
                     let k = args[0].clone();
                     let v = args[1].clone();
+                    self.escape_value(&k);
+                    self.escape_value(&v);
                     let mut mm = m.borrow_mut();
                     if let Some(e) = mm.iter_mut().find(|(mk, _)| values_equal(mk, &k)) {
                         e.1 = v;
@@ -1764,6 +2065,7 @@ impl Vm {
             }
             (Value::Channel(ch), "send") => {
                 if let Some(v) = args.first() {
+                    self.escape_value(v);
                     ch.borrow_mut().queue.push_back(v.clone());
                 }
                 Ok(Value::Nothing)
@@ -1780,6 +2082,12 @@ impl Vm {
                     .find(|(n, _)| n == "__parent")
                     .map(|(_, v)| v.clone())
                     .unwrap_or(Value::Nothing);
+                for a in &args {
+                    self.escape_value(a);
+                }
+                let _pp = self
+                    .enter_val(&parent, true, "ui element store")
+                    .map_err(|m| RuntimeError { msg: m, line: self.cur_line })?;
                 Ok(crate::uiruntime::UiRuntime::add_element(&parent, kind, &args))
             }
             (Value::Channel(ch), "recv") => {
@@ -1969,7 +2277,12 @@ impl Vm {
                     .map(|d| d.as_secs_f64())
                     .unwrap_or(0.0),
             ))),
-            "ui.window" => Ok(Some(self.ui.window(&args))),
+            "ui.window" => {
+                for a in &args {
+                    self.escape_value(a);
+                }
+                Ok(Some(self.ui.window(&args)))
+            }
             "ui.run" => {
                 // ui.run hands off to the compiled native renderer (§16):
                 // build the linux artifact (content-cached) and exec it,
@@ -2146,10 +2459,15 @@ impl Vm {
                     origin: "Err".into(),
                 })))
             }
-            "weak" => Ok(match args.first() {
-                Some(v) => Value::Weak(Rc::new(RefCell::new(v.clone()))),
-                None => Value::Nothing,
-            }),
+            "weak" => {
+                if let Some(v) = args.first() {
+                    self.escape_value(v);
+                }
+                Ok(match args.first() {
+                    Some(v) => Value::Weak(Rc::new(RefCell::new(v.clone()))),
+                    None => Value::Nothing,
+                })
+            }
             "channel" => {
                 // (tx, rx) share one queue — send on tx, receive on rx
                 let st = Rc::new(RefCell::new(ChannelState {
@@ -2162,7 +2480,12 @@ impl Vm {
                     Value::Channel(st),
                 ]))))
             }
-            "ui.window" | "window" => Ok(self.ui.window(&args)),
+            "ui.window" | "window" => {
+                for a in &args {
+                    self.escape_value(a);
+                }
+                Ok(self.ui.window(&args))
+            }
             "route" => {
                 let path = args.first().map(|v| v.display()).unwrap_or_default();
                 self.ui.routes.push(path);
@@ -2170,6 +2493,9 @@ impl Vm {
             }
             "onClick" => {
                 // onClick(btn) { ... } — args: [element, lambda]
+                for a in &args {
+                    self.escape_value(a);
+                }
                 let handler = args.iter().rev().find_map(|v| match v {
                     Value::Func(f) => Some(f.clone()),
                     _ => None,
@@ -2178,6 +2504,14 @@ impl Vm {
                     Value::Ui(e) => Some(e.clone()),
                     _ => None,
                 });
+                // write access on the element covers the handler store
+                let _p = match args.iter().find(|v| matches!(v, Value::Ui(_))) {
+                    Some(ev) => Some(
+                        self.enter_val(ev, true, "onClick handler store")
+                            .map_err(|m| RuntimeError { msg: m, line: self.cur_line })?,
+                    ),
+                    None => None,
+                };
                 if let (Some(e), Some(f)) = (el, handler) {
                     e.borrow_mut().handlers.push(("click".to_string(), f));
                 }

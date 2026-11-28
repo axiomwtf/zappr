@@ -64,15 +64,21 @@ struct ZVal {
   } u;
 };
 
-struct ZVec { ZVal *v; size_t n, cap; };
+/* §15.1 exclusivity: per-object access flag. state packs a writer bit
+   (ZACC_W) plus a reader count; `guarded` marks cells whose borrows can
+   escape (closures, fields, tasks) so unguarded cells skip tracking. */
+struct ZAcc { unsigned state; const char *ro, *wo; unsigned guarded; };
+typedef struct ZAcc ZAcc;
+struct ZVec { ZVal *v; size_t n, cap; ZAcc acc; };
 struct ZPair { ZVal k, v; };
-struct ZZMap { ZPair *p; size_t n, cap; };
+struct ZZMap { ZPair *p; size_t n, cap; ZAcc acc; };
 struct ZRec {
   char *ty;
   char **names;
   char **tynames;
   ZVal *vals;
   size_t n;
+  ZAcc acc;
 };
 struct ZErrV { char *msg; char *origin; };
 struct ZPoisV { char *kind, *origin, *expected, *actual; };
@@ -87,6 +93,7 @@ struct ZUi {
   ZPair *props; size_t pn, pcap;
   ZUi **ch; size_t cn, ccap;
   ZVal handlers;
+  ZAcc acc;
 };
 struct ZWeakV { ZVal v; };
 struct ZVarV { char *name; ZVal inner; };
@@ -95,9 +102,9 @@ struct ZTypeV {
   ZPair *fields; size_t fn, fcap;
 };
 struct ZFuncV { const char *name; ZEnv *env; ZVal want; };
-struct ZRef { ZVal v; };
+struct ZRef { ZVal v; ZAcc acc; };
 struct ZBind { char *name; ZRef *ref; ZBind *next; };
-struct ZEnv { ZEnv *parent; ZBind *binds; };
+struct ZEnv { ZEnv *parent; ZBind *binds; unsigned shared; };
 
 #define ZNOTHING ((ZVal){Z_NOTHING, 0, {0}})
 static const char *z_type_repr(ZVal *v);
@@ -138,7 +145,7 @@ static void z_die(const char *msg) {
 }
 
 /* ---------- allocation (arena-style: never freed, process lifetime) ---------- */
-static void *z_alloc(size_t n) { void *p = malloc(n ? n : 1); return p; }
+static void *z_alloc(size_t n) { void *p = calloc(1, n ? n : 1); return p; }
 static char *z_strdup(const char *s) {
   size_t n = strlen(s ? s : "") + 1;
   char *p = z_alloc(n);
@@ -150,6 +157,120 @@ static char *z_strndup(const char *s, size_t n) {
   memcpy(p, s, n);
   p[n] = 0;
   return p;
+}
+
+/* ---------- §15.1 exclusivity: access flags ---------- */
+#define ZACC_W 0x80000000u
+#define ZACC_RMASK 0x7fffffffu
+
+static void z_escape_env(ZEnv *e, int depth);
+
+/* enter returns 1 when a hold was taken, 0 when the cell is unguarded
+   (no tracking), -1 on conflict (err filled). exit only after 1. */
+static int z_acc_enter(ZAcc *a, int write, const char *origin, char *err, size_t errn) {
+  if (!a || !__atomic_load_n(&a->guarded, __ATOMIC_ACQUIRE)) return 0;
+  for (;;) {
+    unsigned st = __atomic_load_n(&a->state, __ATOMIC_ACQUIRE);
+    unsigned ns;
+    if (write) {
+      if (st != 0) {
+        const char *oo = (st & ZACC_W) ? a->wo : a->ro;
+        snprintf(err, errn,
+          "exclusiveAccess: write `%s` conflicts with %s `%s` — at most one writer or readers, never both (§15.1)",
+          origin, (st & ZACC_W) ? "write" : "read(s) by", oo ? oo : "?");
+        return -1;
+      }
+      ns = ZACC_W;
+    } else {
+      if (st & ZACC_W) {
+        snprintf(err, errn,
+          "exclusiveAccess: read `%s` conflicts with write `%s` — at most one writer or readers, never both (§15.1)",
+          origin, a->wo ? a->wo : "?");
+        return -1;
+      }
+      if ((st & ZACC_RMASK) >= ZACC_RMASK) {
+        snprintf(err, errn, "exclusiveAccess: too many concurrent readers on `%s`", origin);
+        return -1;
+      }
+      ns = st + 1;
+    }
+    if (__atomic_compare_exchange_n(&a->state, &st, ns, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+      if (write) a->wo = origin;
+      else if ((ns & ZACC_RMASK) == 1) a->ro = origin;
+      return 1;
+    }
+  }
+}
+static void z_acc_exit(ZAcc *a, int write) {
+  if (write) __atomic_store_n(&a->state, 0, __ATOMIC_RELEASE);
+  else __atomic_fetch_sub(&a->state, 1u, __ATOMIC_ACQ_REL);
+}
+static ZAcc *z_val_acc(ZVal *v) {
+  /* channels are the cross-thread sync primitive — exempt (§15.1 n/a) */
+  switch (v->tag) {
+    case Z_LIST: case Z_TUPLE: return v->u.vec ? &v->u.vec->acc : NULL;
+    case Z_MAP: return v->u.map ? &v->u.map->acc : NULL;
+    case Z_REC: return v->u.rec ? &v->u.rec->acc : NULL;
+    case Z_UI: return v->u.ui ? &v->u.ui->acc : NULL;
+    default: return NULL;
+  }
+}
+/* mark a value (and everything reachable through it) as escaped: its
+   cells now carry access flags so overlapping borrows fail loudly. */
+static void z_escape(ZVal v, int depth) {
+  if (depth > 64) return;
+  ZAcc *a = z_val_acc(&v);
+  if (a) {
+    if (__atomic_exchange_n(&a->guarded, 1u, __ATOMIC_ACQ_REL)) return;
+  } else if (v.tag == Z_FUNC && v.u.fn) {
+    z_escape_env(v.u.fn->env, depth + 1);
+    return;
+  } else if (v.tag == Z_WEAK && v.u.weak) {
+    z_escape(v.u.weak->v, depth + 1);
+    return;
+  } else if (v.tag == Z_VARIANT && v.u.var) {
+    z_escape(v.u.var->inner, depth + 1);
+    return;
+  } else {
+    return;
+  }
+  switch (v.tag) {
+    case Z_LIST: case Z_TUPLE:
+      for (size_t i = 0; i < v.u.vec->n; i++) z_escape(v.u.vec->v[i], depth + 1);
+      break;
+    case Z_MAP:
+      for (size_t i = 0; i < v.u.map->n; i++) {
+        z_escape(v.u.map->p[i].k, depth + 1);
+        z_escape(v.u.map->p[i].v, depth + 1);
+      }
+      break;
+    case Z_REC:
+      for (size_t i = 0; i < v.u.rec->n; i++) z_escape(v.u.rec->vals[i], depth + 1);
+      break;
+    default: break;
+  }
+}
+static void z_escape_env(ZEnv *e, int depth) {
+  if (!e || depth > 64) return;
+  __atomic_store_n(&e->shared, 1u, __ATOMIC_RELEASE);
+  for (ZBind *b = e->binds; b; b = b->next) {
+    __atomic_store_n(&b->ref->acc.guarded, 1u, __ATOMIC_RELEASE);
+    z_escape(b->ref->v, depth + 1);
+  }
+  z_escape_env(e->parent, depth + 1);
+}
+/* emitted-code helpers: hold a read borrow for the duration of a
+   for-in loop; NULL when the cell needs no tracking. */
+static void *z_iter_hold(ZVal v, const char *origin) {
+  ZAcc *a = z_val_acc(&v);
+  if (!a) return NULL;
+  char ae[256];
+  int h = z_acc_enter(a, 0, origin, ae, sizeof ae);
+  if (h < 0) z_die(ae);
+  return h > 0 ? (void *)a : NULL;
+}
+static void z_iter_free(void *h) {
+  if (h) z_acc_exit((ZAcc *)h, 0);
 }
 
 /* ---------- constructors ---------- */
@@ -302,6 +423,7 @@ static ZVal z_chan_pair(void) {
   return z_tuple((ZVal[]){a, b}, 2);
 }
 static void z_chan_send(ZChan *c, ZVal v) {
+  z_escape(v, 0); /* sent values cross threads — guard their cells */
   pthread_mutex_lock(&c->mu);
   if (c->n == c->cap) { c->cap = c->cap ? c->cap * 2 : 16; c->q = realloc(c->q, c->cap * sizeof(ZVal)); }
   c->q[c->tail] = v; c->tail = (c->tail + 1) % c->cap; c->n++;
@@ -333,18 +455,29 @@ static ZVal z_ui_new(const char *kind) {
   ZUi *u = z_alloc(sizeof(ZUi));
   u->kind = z_strdup(kind); u->props = NULL; u->pn = u->pcap = 0;
   u->ch = NULL; u->cn = u->ccap = 0; u->handlers = z_listv(NULL, 0);
+  __atomic_store_n(&u->acc.guarded, 1u, __ATOMIC_RELEASE); /* ui cells always guarded */
   v.u.ui = u; return v;
 }
 static void z_ui_set(ZUi *u, const char *name, ZVal v) {
+  char ae[256];
+  int h = z_acc_enter(&u->acc, 1, "ui prop write", ae, sizeof ae);
+  if (h < 0) z_die(ae);
+  z_escape(v, 0);
   for (size_t i = 0; i < u->pn; i++)
-    if (!strcmp(u->props[i].k.u.s, name)) { u->props[i].v = v; return; }
+    if (!strcmp(u->props[i].k.u.s, name)) { u->props[i].v = v; if (h > 0) z_acc_exit(&u->acc, 1); return; }
   if (u->pn == u->pcap) { u->pcap = u->pcap ? u->pcap * 2 : 8; u->props = realloc(u->props, u->pcap * sizeof(ZPair)); }
   u->props[u->pn].k = z_str(name); u->props[u->pn].v = v; u->pn++;
+  if (h > 0) z_acc_exit(&u->acc, 1);
 }
 static ZVal z_ui_get(ZUi *u, const char *name) {
+  char ae[256];
+  int h = z_acc_enter(&u->acc, 0, "ui prop read", ae, sizeof ae);
+  if (h < 0) return z_poisonv("exclusiveAccess", ae, "read", "conflicting write");
+  ZVal r = ZNOTHING;
   for (size_t i = 0; i < u->pn; i++)
-    if (!strcmp(u->props[i].k.u.s, name)) return u->props[i].v;
-  return ZNOTHING;
+    if (!strcmp(u->props[i].k.u.s, name)) { r = u->props[i].v; break; }
+  if (h > 0) z_acc_exit(&u->acc, 0);
+  return r;
 }
 static ZVal z_weak(ZVal v) {
   ZVal r = {0}; r.tag = Z_WEAK;
@@ -368,17 +501,33 @@ static ZRef *z_env_find(ZEnv *e, const char *name) {
 }
 static void z_env_define(ZEnv *e, const char *name, ZVal v) {
   ZRef *r = z_alloc(sizeof(ZRef)); r->v = v;
+  unsigned sh = __atomic_load_n(&e->shared, __ATOMIC_ACQUIRE);
+  __atomic_store_n(&r->acc.guarded, sh, __ATOMIC_RELEASE);
+  z_escape(v, 0); /* any binding can alias — treat decls as escapes */
   ZBind *b = z_alloc(sizeof(ZBind));
   b->name = (char *)name; b->ref = r; b->next = e->binds; e->binds = b;
 }
 static ZVal z_env_get(ZEnv *e, const char *name) {
   ZRef *r = z_env_find(e, name);
   if (!r) return z_errv("unknown name", name);
-  return r->v;
+  char ae[256];
+  int h = z_acc_enter(&r->acc, 0, "env read", ae, sizeof ae);
+  if (h < 0) return z_poisonv("exclusiveAccess", ae, "read", "conflicting write");
+  ZVal v = r->v;
+  if (h > 0) z_acc_exit(&r->acc, 0);
+  return v;
 }
 static int z_env_set(ZEnv *e, const char *name, ZVal v) {
   ZRef *r = z_env_find(e, name);
-  if (r) { r->v = v; return 1; }
+  if (r) {
+    char ae[256];
+    int h = z_acc_enter(&r->acc, 1, "env write", ae, sizeof ae);
+    if (h < 0) z_die(ae);
+    r->v = v;
+    if (h > 0) z_acc_exit(&r->acc, 1);
+    z_escape(v, 0);
+    return 1;
+  }
   z_env_define(e, name, v);
   return 0;
 }
@@ -674,7 +823,7 @@ static ZVal z_ge(ZVal a, ZVal b) { return z_bool(z_cmp(a, b) >= 0); }
 static ZVal z_ne_num(ZVal a, ZVal b) { return z_ne(a, b); }
 
 /* ---------- index / field ---------- */
-static ZVal z_index(ZVal v, long long i) {
+static ZVal z_index_body(ZVal v, long long i) {
   v = z_unwrap(v);
   if (i < 0) i = 0; /* interp parity: negative indices clamp to 0 */
   if ((v.tag == Z_TUPLE || v.tag == Z_LIST) && v.u.vec) {
@@ -692,7 +841,17 @@ static ZVal z_index(ZVal v, long long i) {
   }
   return z_errv("cannot index value", "index");
 }
-static ZVal z_field(ZVal obj, const char *name) {
+static ZVal z_index(ZVal v, long long i) {
+  ZVal u = z_unwrap(v);
+  ZAcc *acc = z_val_acc(&u);
+  char ae[256];
+  int h = z_acc_enter(acc, 0, "index read", ae, sizeof ae);
+  if (h < 0) return z_poisonv("exclusiveAccess", ae, "read", "conflicting write");
+  ZVal r = z_index_body(u, i);
+  if (h > 0) z_acc_exit(acc, 0);
+  return r;
+}
+static ZVal z_field_body(ZVal obj, const char *name) {
   obj = z_unwrap(obj);
   if (obj.tag == Z_ERR || obj.tag == Z_POISON) return obj;
   if (obj.tag == Z_REC && obj.u.rec) {
@@ -719,7 +878,17 @@ static ZVal z_field(ZVal obj, const char *name) {
   if (obj.tag == Z_NOTHING) return z_errv("field of null", name);
   return z_errv("no field access on this value", name);
 }
-static void z_field_set(ZVal obj, const char *name, ZVal v) {
+static ZVal z_field(ZVal obj, const char *name) {
+  ZVal u = z_unwrap(obj);
+  ZAcc *acc = z_val_acc(&u);
+  char ae[256];
+  int h = z_acc_enter(acc, 0, "field read", ae, sizeof ae);
+  if (h < 0) return z_poisonv("exclusiveAccess", ae, "read", "conflicting write");
+  ZVal r = z_field_body(u, name);
+  if (h > 0) z_acc_exit(acc, 0);
+  return r;
+}
+static void z_field_set_body(ZVal obj, const char *name, ZVal v) {
   obj = z_unwrap(obj);
   if (obj.tag == Z_REC && obj.u.rec) {
     ZRec *r = obj.u.rec;
@@ -738,6 +907,18 @@ static void z_field_set(ZVal obj, const char *name, ZVal v) {
     long long i = atoll(name + 6);
     if (i >= 0 && (size_t)i < obj.u.vec->n) { obj.u.vec->v[i] = v; return; }
   }
+}
+static void z_field_set(ZVal obj, const char *name, ZVal v) {
+  ZVal u = z_unwrap(obj);
+  /* UI props guard themselves inside z_ui_set — don't double-hold */
+  if (u.tag == Z_UI && u.u.ui) { z_ui_set(u.u.ui, name, v); return; }
+  ZAcc *acc = z_val_acc(&u);
+  char ae[256];
+  int h = z_acc_enter(acc, 1, "field write", ae, sizeof ae);
+  if (h < 0) z_die(ae);
+  z_escape(v, 0); /* stored fields are an escape route (§15.1) */
+  z_field_set_body(u, name, v);
+  if (h > 0) z_acc_exit(acc, 1);
 }
 
 
@@ -997,6 +1178,9 @@ static ZVal z_builtin_named(const char *name, ZVal *pos, int npos, ZVal named, Z
 
 static ZVal z_invoke(ZVal f, ZVal *pos, int npos, ZVal named, ZEnv *caller_env) {
   f = z_unwrap(f);
+  /* a callable carrying an env means its captured bindings escaped —
+     guard their cells before the call can touch them (§15.1) */
+  if (f.tag == Z_FUNC && f.u.fn && f.u.fn->env) z_escape_env(f.u.fn->env, 0);
   if (f.tag == Z_FUNC) {
     const char *name = f.u.fn->name;
     ZFp fp = z_find_fn(name);
@@ -1137,7 +1321,7 @@ static ZVal z_method(ZVal obj, const char *path, ZVal *args, int n, ZEnv *env);
 static void z_ui_render(ZUi *u, int depth);
 static void z_ui_host_run(ZUi *u);
 
-static ZVal z_list_method(ZVal obj, const char *m, ZVal *args, int n, ZEnv *env) {
+static ZVal z_list_method_body(ZVal obj, const char *m, ZVal *args, int n, ZEnv *env) {
   ZVec *v = obj.u.vec;
   if (!strcmp(m, "push")) { if (n) z_vec_push(v, args[0]); return ZNOTHING; }
   if (!strcmp(m, "pop")) { if (v->n) return v->v[--v->n]; return ZNOTHING; }
@@ -1183,8 +1367,19 @@ static ZVal z_list_method(ZVal obj, const char *m, ZVal *args, int n, ZEnv *env)
     return z_errv(buf, "method");
   }
 }
+static ZVal z_list_method(ZVal obj, const char *m, ZVal *args, int n, ZEnv *env) {
+  int wr = !strcmp(m, "push") || !strcmp(m, "pop") || !strcmp(m, "reverse");
+  ZAcc *acc = z_val_acc(&obj);
+  char ae[256];
+  int h = z_acc_enter(acc, wr, wr ? "list mutation" : "list read", ae, sizeof ae);
+  if (h < 0) z_die(ae); /* exclusivity violations fail loudly (§15.1) */
+  if (!strcmp(m, "push") && n) z_escape(args[0], 0);
+  ZVal r = z_list_method_body(obj, m, args, n, env);
+  if (h > 0) z_acc_exit(acc, wr);
+  return r;
+}
 
-static ZVal z_map_method(ZVal obj, const char *m, ZVal *args, int n) {
+static ZVal z_map_method_body(ZVal obj, const char *m, ZVal *args, int n) {
   ZZMap *mp = obj.u.map;
   if (!strcmp(m, "get") && n) {
     for (size_t i = 0; i < mp->n; i++) if (z_eqv_raw(&mp->p[i].k, &args[0])) return mp->p[i].v;
@@ -1205,6 +1400,17 @@ static ZVal z_map_method(ZVal obj, const char *m, ZVal *args, int n) {
     char buf[128]; snprintf(buf, sizeof buf, "unknown map method `%s`", m);
     return z_errv(buf, "method");
   }
+}
+static ZVal z_map_method(ZVal obj, const char *m, ZVal *args, int n) {
+  int wr = !strcmp(m, "set");
+  ZAcc *acc = z_val_acc(&obj);
+  char ae[256];
+  int h = z_acc_enter(acc, wr, wr ? "map write" : "map read", ae, sizeof ae);
+  if (h < 0) z_die(ae);
+  if (wr && n >= 2) z_escape(args[1], 0);
+  ZVal r = z_map_method_body(obj, m, args, n);
+  if (h > 0) z_acc_exit(acc, wr);
+  return r;
 }
 
 static ZVal z_str_method(ZVal obj, const char *m, ZVal *args, int n) {
@@ -1375,6 +1581,10 @@ static void *z_spawn_run(void *p) {
 }
 static ZVal z_spawn(ZVal fn, ZVal *args, int n, ZEnv *env) {
   (void)env;
+  /* task args and the callable's captured env cross threads (§15.1) */
+  fn = z_unwrap(fn);
+  if (fn.tag == Z_FUNC && fn.u.fn && fn.u.fn->env) z_escape_env(fn.u.fn->env, 0);
+  for (int i = 0; i < n; i++) z_escape(args[i], 0);
   ZSpawnJob *j = z_alloc(sizeof(ZSpawnJob));
   j->fn = fn; j->n = n;
   j->args = z_alloc(sizeof(ZVal) * (n + 1));
