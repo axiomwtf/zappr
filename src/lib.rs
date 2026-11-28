@@ -1,57 +1,16 @@
-//! zapgui — native GUI host compiled as a Rust staticlib and linked into
-//! dist/<profile>/<name> (SPEC §16, §18.1). Mirrors the C runtime's ZUi/ZVal layout; the
-//! generated C shim passes the root element plus an invoke callback.
-//! Linux backend: Wayland via dlopen'd libwayland-client + libfontconfig/freetype
-//! (system libs, no shipped .so). Windows backend: Win32 GDI.
+//! zapgui — native GUI host, linked into the zap binary as an rlib.
+//! The interpreter marshals its UiElement tree into the ZUiC layout
+//! below and calls `zap_gui_run`; clicks are reported back through the
+//! invoke callback. Linux backend: Wayland via dlopen'd
+//! libwayland-client + libfontconfig/freetype (system libs, no shipped
+//! .so). Windows backend: Win32 GDI.
 
 #![allow(non_camel_case_types, non_snake_case, dead_code)]
-#![cfg_attr(not(unix), no_std)]
 
-#[cfg(not(unix))]
-extern crate alloc;
-#[cfg(not(unix))]
-use alloc::{format, string::{String, ToString}, vec::Vec};
+use std::ffi::{c_char, c_void, CStr};
+use std::ptr;
 
-#[cfg(not(unix))]
-mod winalloc {
-    use core::alloc::{GlobalAlloc, Layout};
-    use core::ffi::c_void;
-    unsafe extern "C" {
-        fn malloc(size: usize) -> *mut c_void;
-        fn free(p: *mut c_void);
-    }
-    pub struct M;
-    unsafe impl GlobalAlloc for M {
-        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            if l.size() == 0 { return l.align() as *mut u8; }
-            unsafe { malloc(l.size()) as *mut u8 }
-        }
-        unsafe fn dealloc(&self, p: *mut u8, _l: Layout) {
-            unsafe { free(p as *mut c_void) }
-        }
-    }
-    #[global_allocator]
-    pub static GLOBAL: M = M;
-}
-
-use core::ffi::{c_char, c_void, CStr};
-use core::ptr;
-
-#[cfg(not(unix))]
-#[panic_handler]
-fn zapgui_panic(_: &core::panic::PanicInfo) -> ! {
-    loop {}
-}
-
-#[cfg(not(unix))]
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_eh_personality() {}
-
-#[cfg(not(unix))]
-#[unsafe(no_mangle)]
-pub extern "C" fn _Unwind_Resume() -> ! { loop {} }
-
-/* ---------- C ABI mirrors (must match zaprt.c exactly) ---------- */
+/* ---------- C ABI for the interpreter↔renderer bridge ---------- */
 
 pub type ZTag = i32;
 pub const Z_NOTHING: ZTag = 0;
@@ -134,6 +93,9 @@ pub struct ZUiC {
 }
 
 pub type ZInvokeCb = Option<unsafe extern "C" fn(*const ZValC)>;
+/// Re-marshal the live element tree; returns a fresh root. Called before
+/// every render so prop mutations made by click handlers become visible.
+pub type ZRefreshCb = Option<unsafe extern "C" fn() -> *mut ZUiC>;
 
 /* ---------- font8x8 (Public Domain, Daniel Hepper) ---------- */
 
@@ -258,6 +220,77 @@ pub struct Gui {
     pub texts: Vec<TextOp>,
     pub mouse: (i32, i32),
     pub mouse_down: bool,
+    /// topmost element under the pointer last frame — repaint only when
+    /// this changes, not on every motion event
+    pub hover: Option<*mut ZUiC>,
+}
+
+/// topmost laid-out element containing (x, y), or None
+pub fn hit_test(g: &Gui, x: i32, y: i32) -> Option<*mut ZUiC> {
+    for l in g.laid.iter().rev() {
+        let r = l.r;
+        if x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h {
+            return Some(l.el);
+        }
+    }
+    None
+}
+
+/// efficientRedraw (§16.2): diff two frames into damage rects
+/// (x, y, w, h). Per-row changed spans (runs ≤8px apart merged) are
+/// grouped into rects across identical rows; >64 rects falls back to
+/// one full-frame rect.
+pub fn diff_damage(cur: &[u32], prev: &[u32], w: usize, h: usize) -> Vec<(u32, u32, u32, u32)> {
+    let n = w * h;
+    if cur.len() != n || prev.len() != n {
+        return Vec::from([(0, 0, w as u32, h as u32)]);
+    }
+    let mut rows: Vec<Vec<(u32, u32)>> = Vec::with_capacity(h);
+    for y in 0..h {
+        let row = &cur[y * w..(y + 1) * w];
+        let old = &prev[y * w..(y + 1) * w];
+        let mut spans: Vec<(u32, u32)> = Vec::new();
+        let mut x = 0;
+        while x < w {
+            if row[x] != old[x] {
+                let x0 = x;
+                while x < w && row[x] != old[x] {
+                    x += 1;
+                }
+                if let Some(l) = spans.last_mut() {
+                    if (x0 as u32).saturating_sub(l.1) <= 8 {
+                        l.1 = x as u32;
+                        continue;
+                    }
+                }
+                spans.push((x0 as u32, x as u32));
+            } else {
+                x += 1;
+            }
+        }
+        rows.push(spans);
+    }
+    let mut out = Vec::new();
+    let mut y0 = 0;
+    while y0 < h {
+        if rows[y0].is_empty() {
+            y0 += 1;
+            continue;
+        }
+        let spans = &rows[y0];
+        let mut y1 = y0 + 1;
+        while y1 < h && rows[y1] == *spans {
+            y1 += 1;
+        }
+        for &(x0, x1) in spans {
+            out.push((x0, y0 as u32, x1 - x0, (y1 - y0) as u32));
+        }
+        y0 = y1;
+    }
+    if out.len() > 64 {
+        return Vec::from([(0, 0, w as u32, h as u32)]);
+    }
+    out
 }
 
 /// Text output strategy: bitmap font drawn into the framebuffer, or an
@@ -472,21 +505,33 @@ unsafe fn fire_click(el: *mut ZUiC, invoke: ZInvokeCb) {
 
 /* ---------- public entry ---------- */
 
+unsafe fn refresh_root(root: &mut *mut ZUiC, refresh: ZRefreshCb) {
+    if let Some(cb) = refresh {
+        let n = unsafe { cb() };
+        if !n.is_null() {
+            *root = n;
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zap_gui_run(root: *mut ZUiC, invoke: ZInvokeCb) -> i32 {
+pub unsafe extern "C" fn zap_gui_run(root: *mut ZUiC, invoke: ZInvokeCb, refresh: ZRefreshCb, efficient: i32) -> i32 {
     #[cfg(unix)]
     {
         let Some(win) = (unsafe { root.as_ref() }) else { return 0 };
-        match wayland::open(win) {
+        let mut root = root;
+        match wayland::open(win, efficient != 0) {
             Ok(Some((mut xc, mut g))) => {
                 wayland::render(&mut xc, &mut g, root);
                 loop {
                     match wayland::events(&mut xc, &mut g) {
                         wayland::PumpResult::Close => break,
                         wayland::PumpResult::Events(clicked) => {
+                            unsafe { refresh_root(&mut root, refresh) };
                             wayland::render(&mut xc, &mut g, root);
                             if let Some(el) = clicked {
                                 unsafe { fire_click(el, invoke) };
+                                unsafe { refresh_root(&mut root, refresh) };
                                 wayland::render(&mut xc, &mut g, root);
                             }
                         }
@@ -500,16 +545,19 @@ pub unsafe extern "C" fn zap_gui_run(root: *mut ZUiC, invoke: ZInvokeCb) -> i32 
     #[cfg(not(unix))]
     {
         let Some(win) = (unsafe { root.as_ref() }) else { return 0 };
-        match win32::open(win) {
+        let mut root = root;
+        match win32::open(win, efficient != 0) {
             Ok(Some((mut xc, mut g))) => {
                 win32::render(&mut xc, &mut g, root);
                 loop {
                     match win32::events(&mut xc, &mut g) {
                         win32::PumpResult::Close => break,
                         win32::PumpResult::Events(clicked) => {
+                            unsafe { refresh_root(&mut root, refresh) };
                             win32::render(&mut xc, &mut g, root);
                             if let Some(el) = clicked {
                                 unsafe { fire_click(el, invoke) };
+                                unsafe { refresh_root(&mut root, refresh) };
                                 win32::render(&mut xc, &mut g, root);
                             }
                         }

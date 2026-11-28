@@ -43,7 +43,17 @@ unsafe extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
     fn munmap(addr: *mut c_void, len: usize) -> c_int;
     fn close(fd: c_int) -> c_int;
+    fn poll(fds: *mut PollFd, nfds: u64, timeout: c_int) -> c_int;
 }
+
+#[repr(C)]
+struct PollFd {
+    fd: c_int,
+    events: i16,
+    revents: i16,
+}
+const POLLIN: i16 = 0x001;
+const POLLNVAL: i16 = 0x020;
 
 unsafe fn wsym<T>(lib: *mut c_void, name: &str) -> Result<T, ()> {
     let c = CString::new(name).unwrap();
@@ -60,6 +70,11 @@ struct Wl {
     disconnect: unsafe extern "C" fn(WlProxy),
     roundtrip: unsafe extern "C" fn(WlProxy) -> c_int,
     dispatch: unsafe extern "C" fn(WlProxy) -> c_int,
+    dispatch_pending: unsafe extern "C" fn(WlProxy) -> c_int,
+    prepare_read: unsafe extern "C" fn(WlProxy) -> c_int,
+    read_events: unsafe extern "C" fn(WlProxy) -> c_int,
+    cancel_read: unsafe extern "C" fn(WlProxy),
+    get_fd: unsafe extern "C" fn(WlProxy) -> c_int,
     flush: unsafe extern "C" fn(WlProxy) -> c_int,
     add_listener: unsafe extern "C" fn(WlProxy, *const c_void, *mut c_void) -> c_int,
     marshal: unsafe extern "C" fn(WlProxy, u32, ...),
@@ -91,6 +106,11 @@ unsafe fn wl_load() -> Result<Wl, String> {
             disconnect: s!("wl_display_disconnect", unsafe extern "C" fn(WlProxy)),
             roundtrip: s!("wl_display_roundtrip", unsafe extern "C" fn(WlProxy) -> c_int),
             dispatch: s!("wl_display_dispatch", unsafe extern "C" fn(WlProxy) -> c_int),
+            dispatch_pending: s!("wl_display_dispatch_pending", unsafe extern "C" fn(WlProxy) -> c_int),
+            prepare_read: s!("wl_display_prepare_read", unsafe extern "C" fn(WlProxy) -> c_int),
+            read_events: s!("wl_display_read_events", unsafe extern "C" fn(WlProxy) -> c_int),
+            cancel_read: s!("wl_display_cancel_read", unsafe extern "C" fn(WlProxy)),
+            get_fd: s!("wl_display_get_fd", unsafe extern "C" fn(WlProxy) -> c_int),
             flush: s!("wl_display_flush", unsafe extern "C" fn(WlProxy) -> c_int),
             add_listener: s!("wl_proxy_add_listener", unsafe extern "C" fn(WlProxy, *const c_void, *mut c_void) -> c_int),
             marshal: s!("wl_proxy_marshal", unsafe extern "C" fn(WlProxy, u32, ...)),
@@ -292,6 +312,14 @@ pub struct WConn {
     pub click: Option<(i32, i32, bool)>, // x, y, pressed
     pub had_press: bool,
     pub dirty: bool,
+    /// per-slot: compositor released the buffer back to us
+    buf_free: [bool; 2],
+    /// efficientRedraw (§16.2): diff frames, upload/damage only changes
+    pub efficient: bool,
+    /// shadow copy of each shm buffer's pixel content
+    slot_img: [Vec<u32>; 2],
+    /// slot holding the last committed frame (damage diff target)
+    last_slot: usize,
     pool_fd: c_int,
     pub mouse: (i32, i32),
     pub mouse_down: bool,
@@ -335,15 +363,12 @@ unsafe extern "C" fn seat_name(_d: *mut c_void, _s: WlProxy, _n: *const c_char) 
 
 fn fixed(v: i32) -> i32 { v >> 8 }
 
-unsafe extern "C" fn ptr_enter(d: *mut c_void, _p: WlProxy, _serial: u32, _sf: WlProxy, x: i32, y: i32) {
-    let c = unsafe { &mut *(d as *mut WConn) };
-    c.dirty = true; // hover refresh
-}
+unsafe extern "C" fn ptr_enter(_d: *mut c_void, _p: WlProxy, _serial: u32, _sf: WlProxy, _x: i32, _y: i32) {}
 unsafe extern "C" fn ptr_leave(_d: *mut c_void, _p: WlProxy, _s: u32, _sf: WlProxy) {}
 unsafe extern "C" fn ptr_motion(d: *mut c_void, _p: WlProxy, _t: u32, x: i32, y: i32) {
     let c = unsafe { &mut *(d as *mut WConn) };
+    // no dirty here: events() repaints only when the hover target changes
     c.mouse = (fixed(x), fixed(y));
-    c.dirty = true;
 }
 unsafe extern "C" fn ptr_button(d: *mut c_void, _p: WlProxy, _serial: u32, _t: u32, _btn: u32, state: u32) {
     let c = unsafe { &mut *(d as *mut WConn) };
@@ -395,6 +420,23 @@ unsafe extern "C" fn xtl_caps(_d: *mut c_void, _t: WlProxy, _c: *mut c_void) {}
 const SHM_ARGB8888: u32 = 0;
 const SHM_XRGB8888: u32 = 1;
 
+/// wl_buffer "release" listener user data — marks its slot reusable.
+struct BufCtx {
+    conn: *mut WConn,
+    idx: usize,
+}
+
+#[repr(C)]
+struct BufListener {
+    release: unsafe extern "C" fn(*mut c_void, WlProxy),
+    _pad: [usize; 4],
+}
+
+unsafe extern "C" fn buf_release(d: *mut c_void, _b: WlProxy) {
+    let ctx = unsafe { &*(d as *const BufCtx) };
+    unsafe { (*ctx.conn).buf_free[ctx.idx] = true };
+}
+
 unsafe fn pool_destroy(c: &mut WConn) {
     for b in c.buffers.iter_mut() {
         if !b.is_null() { unsafe { (c.f.marshal)(*b, 0) }; *b = ptr::null_mut(); } // wl_buffer.destroy
@@ -434,13 +476,25 @@ unsafe fn pool_create(c: &mut WConn, w: u32, h: u32) -> bool {
         c.buffers[i] = unsafe {
             (c.f.marshal_ctor)(c.pool, 0, c.f.i_buffer, 1, c.f.i_buffer as *const c_void, off, w as i32, h as i32, stride, SHM_XRGB8888)
         };
+        // release listener → slot becomes writable again (tiny leak per
+        // pool recreate; resize is rare)
+        let bl = Box::new(BufListener { release: buf_release, _pad: [0; 4] });
+        let ctx = Box::into_raw(Box::new(BufCtx { conn: c as *mut WConn, idx: i }));
+        unsafe {
+            (c.f.add_listener)(c.buffers[i], &*bl as *const BufListener as *const c_void, ctx as *mut c_void);
+        }
+        std::mem::forget(bl);
     }
+    c.buf_free = [true, true];
+    // fresh buffers: shadows invalid, next frame is a full upload
+    c.slot_img = [Vec::new(), Vec::new()];
+    c.last_slot = usize::MAX;
     true
 }
 
 /* ---- open / render / events ---- */
 
-pub fn open(win: &ZUiC) -> Result<Option<(Box<WConn>, Gui)>, String> {
+pub fn open(win: &ZUiC, efficient: bool) -> Result<Option<(Box<WConn>, Gui)>, String> {
     let f = match unsafe { wl_load() } {
         Ok(f) => f,
         Err(e) => { return Err(e); }
@@ -467,7 +521,9 @@ pub fn open(win: &ZUiC) -> Result<Option<(Box<WConn>, Gui)>, String> {
         g_comp: None, g_shm: None, g_seat: None, g_wm: None,
         closed: false, configure_w: 0, configure_h: 0, have_configure: false, configured: false,
         pending_serial: 0, have_serial: false,
-        click: None, had_press: false, dirty: true, pool_fd: -1, mouse: (-1, -1), mouse_down: false, text: None,
+        click: None, had_press: false, dirty: true, buf_free: [true, true],
+        efficient, slot_img: [Vec::new(), Vec::new()], last_slot: usize::MAX,
+        pool_fd: -1, mouse: (-1, -1), mouse_down: false, text: None,
     });
 
     c.registry = unsafe { (c.f.marshal_ctor)(c.dpy, 1, c.f.i_registry, 1, c.f.i_registry as *const c_void) }; // wl_display.get_registry
@@ -538,17 +594,22 @@ pub fn open(win: &ZUiC) -> Result<Option<(Box<WConn>, Gui)>, String> {
         fb_w: w, fb_h: h,
         fb: vec![0xfff2f2f2; (w * h) as usize],
         laid: Vec::new(), texts: Vec::new(),
-        mouse: (-1, -1), mouse_down: false,
+        mouse: (-1, -1), mouse_down: false, hover: None,
     };
     Ok(Some((c, g)))
 }
 
-/// attach current buffer, damage, commit, flip
-unsafe fn commit(c: &mut WConn, x: i32, y: i32, w: i32, h: i32) {
+/// attach current buffer, damage each rect, commit, flip
+type Dmg = (i32, i32, i32, i32);
+
+unsafe fn commit(c: &mut WConn, damage: &[Dmg]) {
     let buf = c.buffers[c.cur];
     if buf.is_null() { return; }
-    (c.f.marshal)(c.surface, 1, buf, x, y);       // attach
-    (c.f.marshal)(c.surface, 2, x, y, w, h);      // damage
+    c.last_slot = c.cur;
+    (c.f.marshal)(c.surface, 1, buf, 0, 0);       // attach
+    for d in damage {
+        (c.f.marshal)(c.surface, 2, d.0, d.1, d.2, d.3); // damage
+    }
     (c.f.marshal)(c.surface, 6);                  // commit
     c.cur ^= 1;
 }
@@ -572,7 +633,8 @@ pub fn render(c: &mut WConn, g: &mut Gui, root: *mut ZUiC) {
         }
     }
 
-    if !c.dirty { g.texts.clear(); return; }
+    // always repaint: the frame pump calls render() every iteration and
+    // the user asked for max-fps output, not dirty-rect throttling
     c.dirty = false;
     g.laid.clear();
     g.fb.fill(0xfff2f2f2);
@@ -583,33 +645,175 @@ pub fn render(c: &mut WConn, g: &mut Gui, root: *mut ZUiC) {
     super::layout_paint(g, root, engine);
     engine.blit(g);
 
-    // upload fb into the next shm buffer (row-major ARGB, stride = w*4)
+    // upload fb into a released shm buffer; if the compositor still
+    // holds both, drop the frame rather than tear
     let stride = g.fb_w as usize * 4;
-    let off = c.cur * stride * g.fb_h as usize;
-    if !c.shm_data.is_null() && c.buf_w == g.fb_w && c.buf_h == g.fb_h {
-        let dst = unsafe { c.shm_data.add(off) };
-        unsafe {
-            for row in 0..g.fb_h as usize {
-                let s = &g.fb[row * g.fb_w as usize..(row + 1) * g.fb_w as usize];
-                ptr::copy_nonoverlapping(s.as_ptr() as *const u8, dst.add(row * stride), stride);
+    let w = g.fb_w as usize;
+    let h = g.fb_h as usize;
+    let slot = if c.buf_free[0] { 0 } else if c.buf_free[1] { 1 } else { usize::MAX };
+    if slot != usize::MAX && !c.shm_data.is_null() && c.buf_w == g.fb_w && c.buf_h == g.fb_h {
+        let off = slot * stride * h;
+        if c.efficient {
+            efficient_upload(c, g, slot, off, w, h);
+        } else {
+            let dst = unsafe { c.shm_data.add(off) };
+            unsafe {
+                for row in 0..h {
+                    let s = &g.fb[row * w..(row + 1) * w];
+                    ptr::copy_nonoverlapping(s.as_ptr() as *const u8, dst.add(row * stride), stride);
+                }
             }
+            c.buf_free[slot] = false;
+            c.cur = slot;
+            unsafe { commit(c, &[(0, 0, g.fb_w as i32, g.fb_h as i32)]) };
+            unsafe { (c.f.flush)(c.dpy) };
         }
-        unsafe { commit(c, 0, 0, g.fb_w as i32, g.fb_h as i32) };
-        unsafe { (c.f.flush)(c.dpy) };
     }
     g.texts.clear();
 }
 
+/// efficientRedraw (§16.2): write only the pixels that differ from this
+/// buffer's shadow, and damage only the regions that differ from the
+/// last committed frame. A moved element repaints old spot + new spot.
+fn efficient_upload(c: &mut WConn, g: &mut Gui, slot: usize, off: usize, w: usize, h: usize) {
+    let n = w * h;
+    if c.slot_img[slot].len() != n {
+        c.slot_img[slot] = vec![0; n];
+    }
+    let have_last = c.last_slot < 2 && c.slot_img[c.last_slot].len() == n;
+    let own = c.slot_img[slot].as_mut_ptr();
+    let other = if have_last { c.slot_img[c.last_slot].as_ptr() } else { ptr::null() };
+    let fb = g.fb.as_ptr();
+    let dst0 = unsafe { c.shm_data.add(off) } as *mut u32;
+    let mut dmg_rows: Vec<Vec<(u32, u32)>> = Vec::with_capacity(h);
+
+    unsafe {
+        for y in 0..h {
+            let row = std::slice::from_raw_parts(fb.add(y * w), w);
+            let orow = std::slice::from_raw_parts_mut(own.add(y * w), w);
+            let dst = dst0.add(y * w);
+            // spans that differ from this buffer's content → shm + shadow
+            let mut x = 0;
+            while x < w {
+                if row[x] != orow[x] {
+                    let x0 = x;
+                    while x < w && row[x] != orow[x] {
+                        x += 1;
+                    }
+                    ptr::copy_nonoverlapping(row[x0..x].as_ptr(), dst.add(x0), x - x0);
+                    orow[x0..x].copy_from_slice(&row[x0..x]);
+                } else {
+                    x += 1;
+                }
+            }
+            // spans that differ from the last committed frame → damage
+            if have_last {
+                let prev = std::slice::from_raw_parts(other.add(y * w), w);
+                let mut spans: Vec<(u32, u32)> = Vec::new();
+                let mut x = 0;
+                while x < w {
+                    if row[x] != prev[x] {
+                        let x0 = x;
+                        while x < w && row[x] != prev[x] {
+                            x += 1;
+                        }
+                        if let Some(l) = spans.last_mut() {
+                            if (x0 as u32).saturating_sub(l.1) <= 8 {
+                                l.1 = x as u32;
+                                continue;
+                            }
+                        }
+                        spans.push((x0 as u32, x as u32));
+                    } else {
+                        x += 1;
+                    }
+                }
+                dmg_rows.push(spans);
+            }
+        }
+    }
+
+    // group consecutive rows with identical span sets into damage rects
+    let mut damage: Vec<Dmg> = Vec::new();
+    if !have_last {
+        damage.push((0, 0, w as i32, h as i32));
+    } else {
+        let mut y0 = 0;
+        while y0 < h {
+            if dmg_rows[y0].is_empty() {
+                y0 += 1;
+                continue;
+            }
+            let spans = &dmg_rows[y0];
+            let mut y1 = y0 + 1;
+            while y1 < h && dmg_rows[y1] == *spans {
+                y1 += 1;
+            }
+            for &(x0, x1) in spans {
+                damage.push((x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32));
+            }
+            y0 = y1;
+        }
+        if damage.len() > 64 {
+            damage.clear();
+            damage.push((0, 0, w as i32, h as i32));
+        }
+    }
+
+    c.buf_free[slot] = false;
+    c.cur = slot;
+    unsafe {
+        commit(c, &damage);
+        (c.f.flush)(c.dpy);
+    }
+}
+
 pub enum PumpResult { Events(Option<*mut ZUiC>), Close }
 
-/// block for wayland events, then report what changed
+/// non-blocking event drain: dispatch everything already queued, then
+/// poll the display fd once (0 timeout) and read whatever arrived.
+/// Called in a tight loop by the frame pump — the caller repaints every
+/// iteration, so this must never block.
+fn drain_events(c: &mut WConn) -> bool {
+    // events already read into libwayland's buffer
+    while unsafe { (c.f.dispatch_pending)(c.dpy) } > 0 {
+        if c.closed { return false; }
+    }
+    // socket readable? single-shot prepare→read→dispatch. The display fd
+    // is nonblocking: looping read_events here spins on EAGAIN forever.
+    let fd = unsafe { (c.f.get_fd)(c.dpy) };
+    let mut pfd = [PollFd { fd, events: POLLIN, revents: 0 }];
+    if unsafe { poll(pfd.as_mut_ptr(), 1, 0) } <= 0 {
+        return true;
+    }
+    if pfd[0].revents & POLLNVAL != 0 {
+        return false;
+    }
+    if unsafe { (c.f.prepare_read)(c.dpy) } == 0 {
+        // EAGAIN races between poll and read are harmless — just means
+        // another reader got there first; real errors surface via dispatch
+        let _ = unsafe { (c.f.read_events)(c.dpy) };
+        while unsafe { (c.f.dispatch_pending)(c.dpy) } > 0 {
+            if c.closed { return false; }
+        }
+    }
+    true
+}
+
+/// pump pending events once (never blocks), then report what changed
 pub fn events(c: &mut WConn, g: &mut Gui) -> PumpResult {
     g.mouse = c.mouse;
     g.mouse_down = c.mouse_down;
-    let r = unsafe { (c.f.dispatch)(c.dpy) };
-    if r < 0 || c.closed { return PumpResult::Close; }
+    if !drain_events(c) {
+        return PumpResult::Close;
+    }
     g.mouse = c.mouse;
     g.mouse_down = c.mouse_down;
+    let hov = super::hit_test(g, g.mouse.0, g.mouse.1);
+    if hov != g.hover {
+        g.hover = hov;
+        c.dirty = true;
+    }
     let mut clicked = None;
     if let Some((x, y, pressed)) = c.click.take() {
         g.mouse = (x, y);

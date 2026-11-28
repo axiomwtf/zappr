@@ -1,14 +1,14 @@
 mod callcollector;
-mod cbackend;
 mod checker;
 mod codegen;
 mod config;
 mod deps;
 mod fmt;
-mod font8x8;
+mod guibridge;
 mod interp;
 mod lexer;
 mod linker;
+mod pack;
 mod parser;
 mod project;
 mod uiruntime;
@@ -20,6 +20,18 @@ use std::process::ExitCode;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> ExitCode {
+    // artifact mode: a `zap build` output carries an embedded project
+    // archive at its tail — run it directly instead of the CLI.
+    if let Some(root) = pack::embedded_project_root() {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        return match run_embedded(&root, &args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(msg) => {
+                eprintln!("zap: {msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None | Some("--help") | Some("-h") => {
@@ -101,6 +113,17 @@ fn cmd_custom(cmd: &str, rest: &[String]) -> Result<(), String> {
         };
     }
     Err(format!("unknown command `{cmd}` — see `zap --help`"))
+}
+
+/// Run an embedded project extracted from the artifact tail.
+fn run_embedded(root: &Path, cli_args: &[String]) -> Result<(), String> {
+    let p = std::sync::Arc::new(project::load(root, false)?);
+    let mut vm = project::vm_for(&p)?;
+    vm.cli_args = cli_args.to_vec();
+    match vm.run_main() {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("runtime error: {}", e.msg)),
+    }
 }
 
 fn cmd_new(rest: &[String]) -> Result<(), String> {

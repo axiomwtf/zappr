@@ -1,6 +1,6 @@
 # Zappr Specification
 
-**Version:** 0.1.0
+**Version:** 0.2.0
 **Ownership:** Zappr is owned by AXIOM
 **Status:** In development.
 **License:** Apache-2.0
@@ -534,6 +534,7 @@ One rule: **mutate an element's property and it updates.** Setting `.text` patch
 - **Frame-locked.** The loop emits frames only on tick boundaries.
 - **Lazy.** A property change marks the window dirty; the next tick renders exactly one frame; the window goes clean and the loop **sleeps**. A static UI consumes zero CPU.
 - **`frameRate: auto`** (default) — the app mirrors the device's *actual* frame production, exactly, absorbing its jitter, tracking changes mid-run. A number (`frameRate: 144`) is a hard lock.
+- **`efficientRedraw`** (default `false`) — when on, the renderer diffs each frame against what is actually on screen and redraws only the changed regions: a moved element repaints its old spot and its new spot, nothing else. No gating, no dirty tracking — every frame still renders, but only damaged areas are uploaded and composited. Off by default; the full-frame path is the reference behavior.
 
 ### 16.3 Routes
 
@@ -639,7 +640,7 @@ One file. Every key optional except where noted; unknown keys are errors; defaul
 ```go
 # Zappr.yaml
 name: my-app                /// required
-version: 0.1.0              /// required
+version: 0.2.0              /// required
 
 license: MIT                /// optional — overrides LICENSE fuzzy-matching
 licenseHolder: axiomwtf     /// optional — for zap copyright headers
@@ -652,6 +653,7 @@ targets:                    /// optional — default is the host
 stateTtl: 10m               /// optional — WARNING if omitted (§19.1)
 frameRate: auto             /// optional — auto or a number (§16.2)
 autoNull: false             /// optional — ergonomic optional handling (§7.5)
+efficientRedraw: false      /// optional — damage-rect redraws only (§16.2)
 
 sign: true                  /// optional — Ed25519 signing, default true
 signKey: ./signing.key      /// optional — signing key location

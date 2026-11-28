@@ -1,16 +1,12 @@
-//! Win32/GDI backend for libzapgui (SPEC §16). Compiled only for
-//! windows targets; all Win32 imports resolve through generated
-//! import libraries at PE link time. Software ARGB framebuffer in a
-//! top-down 32bpp DIB section, GDI text drawn into the same DC.
+//! Win32/GDI backend for zapgui (SPEC §16). Compiled only for
+//! windows targets; all Win32 imports resolve through the windows-gnu
+//! std import libraries. Software ARGB framebuffer in a top-down
+//! 32bpp DIB section, GDI text drawn into the same DC.
 
 use core::ffi::c_void;
 use core::ptr;
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicPtr, Ordering};
-use alloc::boxed::Box;
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
-use alloc::vec;
 use super::{Gui, TextOp, TextOut, ZUiC};
 use super::{prop_i64, prop_str, layout_paint};
 
@@ -38,6 +34,7 @@ unsafe extern "system" {
         parent: Hwnd, menu: Hmenu, inst: Hinstance, param: *mut c_void) -> Hwnd;
     fn DefWindowProcW(hwnd: Hwnd, msg: u32, w: Wparam, l: Lparam) -> Lresult;
     fn GetMessageW(msg: *mut Msg, hwnd: Hwnd, min: u32, max: u32) -> Bool;
+    fn PeekMessageW(msg: *mut Msg, hwnd: Hwnd, min: u32, max: u32, remove: u32) -> Bool;
     fn TranslateMessage(msg: *const Msg) -> Bool;
     fn DispatchMessageW(msg: *const Msg) -> Lresult;
     fn PostQuitMessage(code: i32);
@@ -177,6 +174,9 @@ pub struct WinConn {
     pub click: Option<(i32, i32, bool)>,
     pub closed: bool,
     pub pending_size: Option<(i32, i32)>,
+    /// efficientRedraw: last presented frame for damage diffs
+    pub efficient: bool,
+    pub prev: Vec<u32>,
     root: *mut ZUiC,
 }
 
@@ -264,6 +264,16 @@ unsafe fn present(c: &WinConn, dst: Hdc) {
     unsafe { let _ = BitBlt(dst, 0, 0, c.w, c.h, c.memdc, 0, 0, SRCCOPY); }
 }
 
+/// efficientRedraw: blit only the damage rects to the window dc
+unsafe fn present_damage(c: &WinConn, dst: Hdc, rects: &[(u32, u32, u32, u32)]) {
+    for &(x, y, w, h) in rects {
+        unsafe {
+            let _ = BitBlt(dst, x as i32, y as i32, w as i32, h as i32,
+                c.memdc, x as i32, y as i32, SRCCOPY);
+        }
+    }
+}
+
 /* ---------- GDI text engine ---------- */
 
 pub struct GdiText<'a> {
@@ -326,7 +336,7 @@ impl TextOut for GdiText<'_> {
 
 pub enum PumpResult { Events(Option<*mut ZUiC>), Close }
 
-pub fn open(win: &ZUiC) -> Result<Option<(Box<WinConn>, Gui)>, String> {
+pub fn open(win: &ZUiC, efficient: bool) -> Result<Option<(Box<WinConn>, Gui)>, String> {
     unsafe {
         let w = prop_i64(win, "width", 800).clamp(1, 8192) as i32;
         let h = prop_i64(win, "height", 600).clamp(1, 8192) as i32;
@@ -368,6 +378,7 @@ pub fn open(win: &ZUiC) -> Result<Option<(Box<WinConn>, Gui)>, String> {
             fonts: RefCell::new(Vec::new()),
             mouse: (-1, -1), mouse_down: false, had_press: false,
             click: None, closed: false, pending_size: None,
+            efficient, prev: Vec::new(),
             root: win as *const ZUiC as *mut ZUiC,
         });
         CONN.store(&mut *c, Ordering::Relaxed);
@@ -385,7 +396,7 @@ pub fn open(win: &ZUiC) -> Result<Option<(Box<WinConn>, Gui)>, String> {
             fb_w: w as u32, fb_h: h as u32,
             fb: vec![0xfff2f2f2; (w * h) as usize],
             laid: Vec::new(), texts: Vec::new(),
-            mouse: (-1, -1), mouse_down: false,
+            mouse: (-1, -1), mouse_down: false, hover: None,
         };
         Ok(Some((c, g)))
     }
@@ -420,7 +431,19 @@ pub fn render(c: &mut WinConn, g: &mut Gui, root: *mut ZUiC) {
     unsafe {
         let dst = GetDC(c.hwnd);
         if !dst.is_null() {
-            present(c, dst);
+            if c.efficient {
+                let w = g.fb_w as usize;
+                let h = g.fb_h as usize;
+                if c.prev.len() != w * h {
+                    c.prev = vec![0; w * h];
+                }
+                let damage = super::diff_damage(&g.fb, &c.prev, w, h);
+                present_damage(c, dst, &damage);
+                c.prev.clear();
+                c.prev.extend_from_slice(&g.fb);
+            } else {
+                present(c, dst);
+            }
             let _ = ReleaseDC(c.hwnd, dst);
         }
     }
@@ -432,34 +455,34 @@ pub fn events(c: &mut WinConn, g: &mut Gui) -> PumpResult {
         let mut msg = Msg { hwnd: ptr::null_mut(), message: 0, wparam: 0,
             lparam: 0, time: 0, pt_x: 0, pt_y: 0 };
         loop {
-            let r = GetMessageW(&mut msg, c.hwnd, 0, 0);
-            if r <= 0 { return PumpResult::Close; }
+            // drain the queue without blocking — the frame pump repaints
+            // every iteration, so this must return immediately when idle
+            let r = PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, 1);
+            if r <= 0 { break; }
+            if msg.message == 0x0012 {
+                return PumpResult::Close; // WM_QUIT
+            }
             let _ = TranslateMessage(&msg);
             let _ = DispatchMessageW(&msg);
             if c.closed { return PumpResult::Close; }
+        }
 
-            // repaint on mouse move / resize
-            if c.mouse != g.mouse || c.mouse_down != g.mouse_down || c.pending_size.is_some() {
-                g.mouse = c.mouse;
-                g.mouse_down = c.mouse_down;
-                let root = c.root;
-                render(c, g, root);
-            }
-
-            if let Some((x, y, pressed)) = c.click.take() {
-                g.mouse = (x, y);
-                if pressed {
-                    let mut clicked = None;
-                    for l in g.laid.iter().rev() {
-                        let r = l.r;
-                        if x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h {
-                            clicked = Some(l.el);
-                            break;
-                        }
+        g.mouse = c.mouse;
+        g.mouse_down = c.mouse_down;
+        if let Some((x, y, pressed)) = c.click.take() {
+            g.mouse = (x, y);
+            if pressed {
+                let mut clicked = None;
+                for l in g.laid.iter().rev() {
+                    let r = l.r;
+                    if x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h {
+                        clicked = Some(l.el);
+                        break;
                     }
-                    return PumpResult::Events(clicked);
                 }
+                return PumpResult::Events(clicked);
             }
         }
+        PumpResult::Events(None)
     }
 }

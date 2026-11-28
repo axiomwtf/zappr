@@ -49,6 +49,8 @@ pub struct Config {
     pub state_ttl: Option<String>,
     pub frame_rate: Option<YVal>,
     pub auto_null: bool,
+    /// damage-rect redraws: only changed regions are uploaded/composited
+    pub efficient_redraw: bool,
     pub sign: bool,
     pub sign_key: Option<String>,
     /// val: entries — read verbatim as zapYaml.x
@@ -67,6 +69,7 @@ const KNOWN_KEYS: &[&str] = &[
     "stateTtl",
     "frameRate",
     "autoNull",
+    "efficientRedraw",
     "sign",
     "signKey",
     "val",
@@ -110,6 +113,13 @@ pub fn parse(src: &str) -> Result<Config, String> {
             "frameRate" => c.frame_rate = Some(v.clone()),
             "autoNull" => {
                 c.auto_null = match v {
+                    YVal::Bool(b) => *b,
+                    YVal::Str(s) => s == "true",
+                    _ => false,
+                }
+            }
+            "efficientRedraw" => {
+                c.efficient_redraw = match v {
                     YVal::Bool(b) => *b,
                     YVal::Str(s) => s == "true",
                     _ => false,

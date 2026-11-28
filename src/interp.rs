@@ -1818,6 +1818,11 @@ impl Vm {
         Ok(Some(self.call_fn_id(id, args)?))
     }
 
+    /// Re-enter a FuncVal from the native GUI bridge's click callback.
+    pub fn call_gui_func(&mut self, f: &Rc<FuncVal>, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        self.call_func_value(f, args)
+    }
+
     fn call_func_value(&mut self, f: &FuncVal, args: Vec<Value>) -> Result<Value, RuntimeError> {
         if f.body_id == usize::MAX {
             // builtin marker — dispatch by name
@@ -2284,43 +2289,28 @@ impl Vm {
                 Ok(Some(self.ui.window(&args)))
             }
             "ui.run" => {
-                // ui.run hands off to the compiled native renderer (§16):
-                // build the linux artifact (content-cached) and exec it,
-                // so `zap run` and `zap build` share one Wayland backend.
-                #[cfg(unix)]
-                {
-                    if let Some(p) = self.project.clone() {
-                        if let Err(e) = crate::codegen::build(&p, self, "linux", false) {
-                            return Err(RuntimeError { msg: e, line: self.cur_line });
-                        }
-                        let (out, _) = crate::codegen::artifact_paths(&p, "linux", false);
-                        use std::os::unix::process::CommandExt;
-                        let args: Vec<String> = self.cli_args.clone();
-                        let err = std::process::Command::new(&out)
-                            .args(&args)
-                            .exec();
-                        return Err(RuntimeError { msg: format!("cannot exec {}: {err}", out.display()), line: self.cur_line });
-                    }
+                // ui.run drives the native renderer in-process through the
+                // bridge: the UiElement tree is marshalled to the native
+                // ZUiC ABI and click handlers re-enter this Vm (§16).
+                let win = args
+                    .first()
+                    .and_then(|v| match v {
+                        Value::Ui(e) => Some(e.clone()),
+                        _ => None,
+                    })
+                    .or_else(|| self.ui.windows.first().cloned());
+                #[cfg(any(unix, windows))]
+                if let Some(w) = win {
+                    let eff = self
+                        .project
+                        .as_ref()
+                        .map(|p| p.config.efficient_redraw)
+                        .unwrap_or(false);
+                    crate::guibridge::run(&w, self as *mut Vm, eff);
+                    return Ok(Some(Value::Nothing));
                 }
-                #[cfg(not(unix))]
-                {
-                    if let Some(p) = self.project.clone() {
-                        if let Err(e) = crate::codegen::build(&p, self, "windows", false) {
-                            return Err(RuntimeError { msg: e, line: self.cur_line });
-                        }
-                        let (out, _) = crate::codegen::artifact_paths(&p, "windows", false);
-                        let args: Vec<String> = self.cli_args.clone();
-                        return match std::process::Command::new(&out).args(&args).status() {
-                            Ok(st) => Ok(Some(Value::Int(st.code().unwrap_or(1) as i64))),
-                            Err(e2) => Err(RuntimeError {
-                                msg: format!("cannot run {}: {e2}", out.display()),
-                                line: self.cur_line,
-                            }),
-                        };
-                    }
-                }
-                // headless fallback only reachable when the interpreter is
-                // driven without a project (tests); real runs hand off above
+                // headless fallback only reachable without a window or on
+                // targets with no native backend (tests)
                 let mut ui = std::mem::take(&mut self.ui);
                 for w in &ui.windows {
                     let mut el = w.borrow_mut();
@@ -2513,7 +2503,9 @@ impl Vm {
                     None => None,
                 };
                 if let (Some(e), Some(f)) = (el, handler) {
-                    e.borrow_mut().handlers.push(("click".to_string(), f));
+                    let mut b = e.borrow_mut();
+                    b.handlers.push(("click".to_string(), f));
+                    b.dirty = true;
                 }
                 self.ui.last_handler = args.iter().find_map(|v| match v {
                     Value::Func(f) => Some(f.clone()),

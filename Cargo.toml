@@ -1,6 +1,6 @@
 [package]
 name = "zap"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Zappr compiler and toolchain: one binary, compiler, build driver, runner, package manager and formatter."
@@ -8,7 +8,7 @@ description = "Zappr compiler and toolchain: one binary, compiler, build driver,
 [lib]
 name = "zapgui"
 path = "src/lib.rs"
-crate-type = ["staticlib", "rlib"]
+crate-type = ["rlib"]
 
 [[bin]]
 name = "zap"

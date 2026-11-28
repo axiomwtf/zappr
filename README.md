@@ -8,7 +8,7 @@
 
 Zappr is a compiled, fully native programming language. The tool is `zap`: one binary that is compiler, build driver, runner, package manager and formatter at once. There is no separate compiler entry point and no tooling split — `zap` is the only way in. Zappr yoinks the good parts of C, C++, TypeScript, Rust, Go and the rest, and leaves the bad parts. It compiles to Linux, Windows and the Web, all native. Native UI is built into the language, not bolted on. Configuration is one `Zappr.yaml`. Compile goal: under 5 seconds for a full build, incremental builds faster. Zappr is owned by AXIOM.
 
-> **Status:** `0.1.0` (in development)
+> **Status:** `0.2.0` (in development)
 
 ## Why
 
@@ -40,9 +40,9 @@ zap (one Rust binary)
 ├── parser         → AST
 ├── checker        → types, exclusivity, bounds, naming law, tidiness law, no-shadowing
 ├── call-collector → transitive closure of calls (the whole inclusion story)
-├── codegen        → native codegen for linux / windows / wasm (no LLVM)
+├── codegen        → self-contained artifacts: zap host binary + packed project archive
 ├── linker config  → static binaries, Ed25519 signing
-└── ui runtime     → native renderer + DOM bridge for web
+└── ui runtime     → native renderer (Wayland / Win32 GDI)
 ```
 
 - **Parallel by module.** Independent `.znz` files compile concurrently, Go-style.
@@ -239,7 +239,7 @@ One file. Every key optional except where noted; unknown keys are errors; defaul
 ```go
 # Zappr.yaml
 name: my-app                /// required
-version: 0.1.0              /// required
+version: 0.2.0              /// required
 
 license: MIT                /// optional — overrides LICENSE fuzzy-matching
 licenseHolder: axiomwtf     /// optional — for zap copyright headers

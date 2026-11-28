@@ -231,7 +231,7 @@ pub fn scaffold(name: &str, dir: &Path) -> Result<(), String> {
     std::fs::write(
         root.join("Zappr.yaml"),
         format!(
-            "name: {name}\nversion: 0.1.0\n\ntargets:\n  - linux\n\n# val:\n#   appName: {name}\n"
+            "name: {name}\nversion: 0.2.0\n\ntargets:\n  - linux\n\n# val:\n#   appName: {name}\n"
         ),
     )
     .map_err(|e| e.to_string())?;

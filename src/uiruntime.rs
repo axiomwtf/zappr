@@ -89,8 +89,10 @@ impl UiRuntime {
         }
         // attach to parent's children when parent is a Ui value
         if let crate::value::Value::Ui(parent_el) = parent {
-            parent_el.borrow_mut().children.push(Rc::new(RefCell::new(el)));
-            return crate::value::Value::Ui(parent_el.borrow().children.last().unwrap().clone());
+            let mut p = parent_el.borrow_mut();
+            p.children.push(Rc::new(RefCell::new(el)));
+            p.dirty = true;
+            return crate::value::Value::Ui(p.children.last().unwrap().clone());
         }
         crate::value::Value::Ui(Rc::new(RefCell::new(el)))
     }
