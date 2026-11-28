@@ -94,7 +94,12 @@ pub enum Value {
         actual: String,
     },
     Channel(Arc<ChannelShared>),
-    Weak(Arc<Mutex<Value>>),
+    /// A weak handle to shared storage (§15): holds a downgrade of the
+    /// referent's Arc, never keeps it alive. Scalars have no shared
+    /// storage and are held strongly. Reading yields the (T, null) pad —
+    /// an expired reference reads as the null side, never a dangling
+    /// pointer.
+    Weak(std::sync::Arc<WeakVal>),
     /// UI element — native renderer / DOM bridge share this value (§16)
     Ui(Arc<Mutex<crate::uiruntime::UiElement>>),
     Nothing,
@@ -121,6 +126,55 @@ impl PoisonKind {
 pub struct ErrVal {
     pub msg: String,
     pub origin: String,
+}
+
+/// The storage a weak handle points at (§15). Shared, mutable values are
+/// downgraded Arcs into the referent's own cell; scalars are held strongly
+/// (no shared storage to expire).
+#[derive(Clone, Debug)]
+pub enum WeakVal {
+    Strong(Value),
+    Str(std::sync::Weak<Mutex<String>>),
+    Tuple(std::sync::Weak<Mutex<Vec<Value>>>),
+    Record(String, std::sync::Weak<Mutex<Vec<(String, Value)>>>),
+    List(std::sync::Weak<Mutex<Vec<Value>>>),
+    Map(std::sync::Weak<Mutex<Vec<(Value, Value)>>>),
+    Func(std::sync::Weak<FuncVal>),
+}
+
+/// Build a weak handle to a value (§15): downgrade the referent's storage
+/// Arc so the handle never keeps it alive.
+pub fn weak_of(v: &Value) -> WeakVal {
+    match v {
+        Value::Str(s) => WeakVal::Str(Arc::downgrade(s)),
+        Value::Tuple(t) => WeakVal::Tuple(Arc::downgrade(t)),
+        Value::Record { ty, fields } => WeakVal::Record(ty.clone(), Arc::downgrade(fields)),
+        Value::List(l) => WeakVal::List(Arc::downgrade(l)),
+        Value::Map(m) => WeakVal::Map(Arc::downgrade(m)),
+        Value::Func(f) => WeakVal::Func(Arc::downgrade(f)),
+        other => WeakVal::Strong(other.clone()),
+    }
+}
+
+impl WeakVal {
+    /// Reading a weak yields the (T, null) pad (§15): a live referent
+    /// upgrades to its value; an expired one reads as null.
+    pub fn upgrade(&self) -> Option<Value> {
+        match self {
+            WeakVal::Strong(v) => Some(v.clone()),
+            WeakVal::Str(w) => w.upgrade().map(Value::Str),
+            WeakVal::Tuple(w) => w.upgrade().map(Value::Tuple),
+            WeakVal::Record(ty, w) => {
+                w.upgrade().map(|f| Value::Record {
+                    ty: ty.clone(),
+                    fields: f,
+                })
+            }
+            WeakVal::List(w) => w.upgrade().map(Value::List),
+            WeakVal::Map(w) => w.upgrade().map(Value::Map),
+            WeakVal::Func(w) => w.upgrade().map(Value::Func),
+        }
+    }
 }
 
 /// Lexical environment: stack of scopes (innermost last).
@@ -258,14 +312,45 @@ impl Value {
             Value::Poison { .. } => TypeRepr::Poison,
             Value::Channel(_) => TypeRepr::Channel(Box::new(TypeRepr::Any)),
             Value::Ui(_) => TypeRepr::Any,
-            Value::Weak(_) => TypeRepr::Any,
+            Value::Weak(w) => match w.upgrade() {
+                Some(v) => v.type_repr(),
+                None => TypeRepr::Null,
+            },
             Value::Nothing => TypeRepr::Any,
         }
     }
 
+    /// autoNull (§7.5): padding is automatic — the null side of the pad
+    /// satisfies any expected type, so a plain `(T)` annotation accepts a
+    /// null; `(T)` and `(T, null)` are interchangeable; access
+    /// auto-unwraps separately.
+    pub fn satisfies_autonull(&self, expected: &TypeRepr) -> bool {
+        if matches!(self, Value::Nothing) {
+            return true;
+        }
+        if let (Value::Tuple(t), TypeRepr::Tuple(ts)) = (self, expected) {
+            let t = t.lock().unwrap();
+            if t.len() != ts.len() {
+                // one side carries the implied null pad slot
+                let pad_expected = ts.len() == t.len() + 1
+                    && matches!(ts.last(), Some(TypeRepr::Null));
+                let pad_value =
+                    t.len() == ts.len() + 1 && matches!(t.last(), Some(Value::Nothing));
+                if pad_expected || pad_value {
+                    let n = t.len().min(ts.len());
+                    return t[..n]
+                        .iter()
+                        .zip(ts[..n].iter())
+                        .all(|(v, ty)| v.satisfies(ty) || matches!(ty, TypeRepr::Any));
+                }
+                return false;
+            }
+        }
+        self.satisfies(expected)
+    }
+
     /// Does this value satisfy the expected type? Used by `.fnType` and `as` casts.
-    pub fn satisfies(&self, expected: &TypeRepr) -> bool {
-        match expected {
+    pub fn satisfies(&self, expected: &TypeRepr) -> bool {        match expected {
             TypeRepr::Any => true,
             TypeRepr::Null => matches!(self, Value::Nothing),
             TypeRepr::Int => matches!(self, Value::Int(_)),
@@ -397,7 +482,10 @@ impl Value {
             ),
             Value::Channel(_) => "<channel>".into(),
             Value::Ui(el) => format!("<ui.{}>", el.lock().unwrap().kind),
-            Value::Weak(_) => "<weak>".into(),
+            Value::Weak(w) => match w.upgrade() {
+                Some(v) => v.display(),
+                None => "null".into(),
+            },
             Value::Nothing => "null".into(),
         }
     }
@@ -428,7 +516,17 @@ impl fmt::Display for Value {
 
 /// Loose equality for `==`/`!=`.
 pub fn values_equal(a: &Value, b: &Value) -> bool {
+    // a weak reads as the (T, null) pad (§15): compare upgraded, an
+    // expired weak equals only null
     match (a, b) {
+        (Value::Weak(x), other) => match x.upgrade() {
+            Some(v) => values_equal(&v, other),
+            None => matches!(other, Value::Nothing),
+        },
+        (_, Value::Weak(y)) => match y.upgrade() {
+            Some(v) => values_equal(a, &v),
+            None => matches!(a, Value::Nothing),
+        },
         (Value::Int(x), Value::Int(y)) => x == y,
         (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => {
             (*x as f64) == *y

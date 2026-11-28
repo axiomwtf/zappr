@@ -401,8 +401,9 @@ impl Vm {
                 return;
             }
             Value::Weak(w) => {
-                let inner = w.lock().unwrap().clone();
-                self.escape_value_seen(&inner, seen);
+                if let Some(inner) = w.upgrade() {
+                    self.escape_value_seen(&inner, seen);
+                }
                 return;
             }
             _ => {}
@@ -1217,12 +1218,17 @@ impl Vm {
         match ty {
             TypeExpr::Named(name) => match v {
                 Value::Record { ty: t, .. } => t == name,
+                Value::Nothing if self.prog.auto_null => true,
                 _ => false,
             },
             TypeExpr::Union(vs) => vs.iter().any(|t| self.type_expr_matches(t, v)),
             _ => {
                 let tr = self.type_expr_repr(ty);
-                v.satisfies(&tr)
+                if self.prog.auto_null {
+                    v.satisfies_autonull(&tr)
+                } else {
+                    v.satisfies(&tr)
+                }
             }
         }
     }
@@ -1231,11 +1237,16 @@ impl Vm {
         match ty {
             TypeExpr::Named(name) => match v {
                 Value::Record { ty: t, .. } => t == name,
+                Value::Nothing if self.prog.auto_null => true,
                 _ => false,
             },
             _ => {
                 let tr = self.type_expr_repr(ty);
-                v.satisfies(&tr)
+                if self.prog.auto_null {
+                    v.satisfies_autonull(&tr)
+                } else {
+                    v.satisfies(&tr)
+                }
             }
         }
     }
@@ -1531,15 +1542,34 @@ impl Vm {
             line: self.cur_line,
         })?;
         // autoNull (§7.5): optionality is inferred, padding is automatic,
-        // access auto-unwraps — an absent value read surfaces as
-        // wrongReturnType at first use. The explicit pad form is unchanged.
-        if self.prog.auto_null && matches!(v, Value::Nothing) {
-            return Ok(Value::Poison {
-                kind: PoisonKind::WrongReturnType,
-                origin: format!("optional access to `{name}`"),
-                expected: "a value".into(),
-                actual: "null".into(),
-            });
+        // access auto-unwraps — a stored (T, null) pad reads as T, an
+        // absent value read surfaces as wrongReturnType at first use. The
+        // explicit pad form is unchanged when autoNull is off.
+        if self.prog.auto_null {
+            if let Value::Tuple(t) = &v {
+                let is_pad = t.lock().unwrap().len() == 2
+                    && matches!(t.lock().unwrap()[1], Value::Nothing);
+                if is_pad {
+                    let slot0 = t.lock().unwrap()[0].clone();
+                    if matches!(slot0, Value::Nothing) {
+                        return Ok(Value::Poison {
+                            kind: PoisonKind::WrongReturnType,
+                            origin: format!("optional access to `{name}`"),
+                            expected: "a value".into(),
+                            actual: "null".into(),
+                        });
+                    }
+                    return Ok(slot0);
+                }
+            }
+            if matches!(v, Value::Nothing) {
+                return Ok(Value::Poison {
+                    kind: PoisonKind::WrongReturnType,
+                    origin: format!("optional access to `{name}`"),
+                    expected: "a value".into(),
+                    actual: "null".into(),
+                });
+            }
         }
         Ok(v)
     }
@@ -2195,6 +2225,9 @@ impl Vm {
         let Some(tr) = value_to_type(tv) else {
             return self.err("fnType argument must be a type value".into());
         };
+        if self.prog.auto_null && matches!(v, Value::Nothing) {
+            return Ok(v.clone());
+        }
         if v.satisfies(&tr) {
             Ok(v.clone())
         } else {
@@ -2772,7 +2805,7 @@ impl Vm {
                     self.escape_value(v);
                 }
                 Ok(match args.first() {
-                    Some(v) => Value::Weak(Arc::new(Mutex::new(v.clone()))),
+                    Some(v) => Value::Weak(Arc::new(crate::value::weak_of(v))),
                     None => Value::Nothing,
                 })
             }
