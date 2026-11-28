@@ -477,6 +477,7 @@ impl Vm {
     pub fn load_module(&mut self, module_name: &str, prog: &Program) -> Result<(), RuntimeError> {
         let module_scope = vec![Arc::new(Mutex::new(HashMap::new()))];
         let mut fn_ids = Vec::new();
+        let mut top_decls: Vec<&Stmt> = Vec::new();
         for item in &prog.items {
             match item {
                 Item::Fn {
@@ -506,8 +507,21 @@ impl Vm {
                         .push(id);
                     fn_ids.push(id);
                 }
+                Item::TopDecl(decls) => top_decls.extend(decls.iter()),
                 Item::Use(_) => {}
             }
+        }
+        // module-level `!` declarations (§7.6) evaluate once, now, into the
+        // module scope every fn of this module shares — fns registered
+        // first so init expressions may call them
+        if !top_decls.is_empty() {
+            let saved = self.scopes.clone();
+            self.cur_module = module_name.to_string();
+            self.scopes = module_scope.clone();
+            for d in &top_decls {
+                self.exec_stmt(d)?;
+            }
+            self.scopes = saved;
         }
         let p = self.prog_mut();
         p.modules.insert(

@@ -153,6 +153,11 @@ fn cmd_new(rest: &[String]) -> Result<(), String> {
 fn cmd_run(rest: &[String]) -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let p = std::sync::Arc::new(project::load(&cwd, false)?);
+    // the checker gates execution too — compile errors never reach runtime
+    let notes = project::check_project(&p)?;
+    for n in &notes {
+        eprintln!("zap: {n}");
+    }
     let mut vm = project::vm_for(&p)?;
     // argv for args.* (§9.5): everything after `--`, else all of rest
     let args: Vec<String> = if let Some(i) = rest.iter().position(|a| a == "--") {

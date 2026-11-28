@@ -17,6 +17,12 @@ use std::process::Command;
 /// `zap build` entry point — content-hash artifact cache (§21).
 /// `release` selects dist/release vs dist/debug.
 pub fn build(p: &Project, vm: &mut Vm, target: &str, release: bool) -> Result<(), String> {
+    // §18 pipeline: build = check + codegen. Checker errors are compile
+    // errors — no artifact without a clean check. Warnings print, never block.
+    let notes = crate::project::check_project(p)?;
+    for n in &notes {
+        eprintln!("zap: {n}");
+    }
     let key = build_cache_key(p, target, release);
     let cdir = artifact_cache_dir();
     let cfile = cdir.join(format!("{key:016x}"));
@@ -598,27 +604,29 @@ fn build_web(p: &Project, out: &Path) -> Result<(), String> {
     } else {
         artifact
     };
-    std::fs::write(out, &artifact)
-        .map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+    // §18.1: the web target is exactly two files — app.wasm + 404.html.
+    // The 404 name makes GitHub Pages route deep links into the app; the
+    // loader reads the real URL and the router renders the right page.
+    let dir = out.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+    let wasm_path = dir.join("app.wasm");
+    let html_path = dir.join("404.html");
+    std::fs::write(&wasm_path, &artifact)
+        .map_err(|e| format!("cannot write {}: {e}", wasm_path.display()))?;
 
-    let wasm_name = out
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "app.wasm".into());
+    let wasm_name = "app.wasm";
     let title = p.config.name.clone().unwrap_or_else(|| "zap app".into());
     let js = include_str!("webshim.js")
-        .replace("__ZAP_WASM_NAME__", &wasm_name)
+        .replace("__ZAP_WASM_NAME__", wasm_name)
         .replace("__ZAP_TITLE__", &title);
     let html = format!(
         "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>{title}</title>\n\
          <style>body{{background:#111;color:#ddd;font:14px/1.5 monospace;padding:1em;white-space:pre-wrap}}</style>\n\
          </head><body><div id=\"out\"></div><script>\n{js}\n</script></body></html>\n"
     );
-    let html_path = out.with_extension("html");
     std::fs::write(&html_path, html)
         .map_err(|e| format!("cannot write {}: {e}", html_path.display()))?;
 
     println!("built {} + {} (wasm32-wasip1, {} bytes, signed={})",
-        out.display(), html_path.display(), artifact.len(), p.config.sign);
+        wasm_path.display(), html_path.display(), artifact.len(), p.config.sign);
     Ok(())
 }

@@ -3,7 +3,7 @@
 //! exclusivity law (§15.1): moves are compile-time and local, visible
 //! borrows are checked per-function.
 
-use crate::parser::{Expr, ForPat, Item, MatchArm, Program, Stmt, StrPart, TypeExpr};
+use crate::parser::{BinOp, Expr, ForPat, Item, MatchArm, Program, Stmt, StrPart, TypeExpr};
 use std::collections::{HashMap, HashSet};
 
 /// Names that always resolve without declaration.
@@ -91,12 +91,30 @@ struct Borrow {
     origin: String,
 }
 
+/// Statically known type of a binding's value — feeds §7.6 match
+/// exhaustiveness. Inference is strictly local: constructor calls,
+/// union definitions, fnType narrowing and same-module fn return sets.
+#[derive(Clone)]
+enum VarTy {
+    Unknown,
+    /// `!s = Circle(...)` — s is that record/variant type
+    Named(String),
+    /// the value may be any of these variants (inferred fn return set)
+    Union(Vec<String>),
+}
+
+#[derive(Clone)]
+struct Binding {
+    copyable: bool,
+    ty: VarTy,
+}
+
 struct Checker<'a> {
     errors: Vec<String>,
     warnings: Vec<String>,
     globals: &'a GlobalSyms,
-    /// lexical scopes; innermost last — name → copyable-scalar flag
-    scope: Vec<HashMap<String, bool>>,
+    /// lexical scopes; innermost last — name → binding
+    scope: Vec<HashMap<String, Binding>>,
     /// bindings moved out of — dead until re-declared (§15.1)
     moved: HashSet<String>,
     /// live borrows of binding storage (iteration)
@@ -104,9 +122,27 @@ struct Checker<'a> {
     /// names visible to an enclosing lambda/parallel body — shared, so
     /// they cannot be moved out of (§15.1 escape hatch)
     captured: HashSet<String>,
+    /// known union type definitions: `!Shape = Circle | Rect` (§7.6)
+    union_defs: HashMap<String, Vec<String>>,
+    /// inferred return variant sets for this module's fns (same module
+    /// only — no cross-module fixpoint, §4 fast-by-construction)
+    ret_tys: HashMap<String, Vec<String>>,
+    /// module-level `!Name = ...` declarations (§7.6) — visible to every
+    /// fn in the module
+    top_decls: HashMap<String, VarTy>,
 }
 
 pub fn check_program(prog: &Program, module: &str, globals: &GlobalSyms) -> CheckOutcome {
+    // per-fn return variant sets (§7.6): every `return` in the fn must be
+    // a constructor call on a PascalCase type for the set to be known
+    let mut ret_tys: HashMap<String, Vec<String>> = HashMap::new();
+    for item in &prog.items {
+        if let Item::Fn { name, body, .. } = item {
+            if let Some(vs) = fn_return_variants(body) {
+                ret_tys.insert(name.clone(), vs);
+            }
+        }
+    }
     let mut c = Checker {
         errors: Vec::new(),
         warnings: Vec::new(),
@@ -115,7 +151,31 @@ pub fn check_program(prog: &Program, module: &str, globals: &GlobalSyms) -> Chec
         moved: HashSet::new(),
         borrows: Vec::new(),
         captured: HashSet::new(),
+        union_defs: HashMap::new(),
+        ret_tys,
+        top_decls: HashMap::new(),
     };
+    // module-level declarations first: union defs and types every fn sees
+    for item in &prog.items {
+        if let Item::TopDecl(decls) = item {
+            for d in decls {
+                match d {
+                    Stmt::Decl { name, init, .. } => {
+                        if let Some(vs) = union_of_init(init) {
+                            c.union_defs.insert(name.clone(), vs);
+                        }
+                        c.top_decls.insert(name.clone(), decl_var_ty(init));
+                    }
+                    Stmt::DeclTuple { names, .. } => {
+                        for n in names {
+                            c.top_decls.insert(n.clone(), VarTy::Unknown);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
     for item in &prog.items {
         if let Item::Fn { name, params, body, .. } = item {
             c.scope = vec![HashMap::new()];
@@ -128,7 +188,7 @@ pub fn check_program(prog: &Program, module: &str, globals: &GlobalSyms) -> Chec
                     .as_ref()
                     .map(|t| scalar_ty(t))
                     .unwrap_or(false);
-                c.declare(&p.name, copyable);
+                c.declare(&p.name, copyable, VarTy::Unknown);
             }
             c.stmts(body, module, name);
         }
@@ -137,6 +197,115 @@ pub fn check_program(prog: &Program, module: &str, globals: &GlobalSyms) -> Chec
         errors: c.errors,
         warnings: c.warnings,
     }
+}
+
+/// Inferred variant set of a fn's returns (§7.6): every `return` in the
+/// body — through if/match arms — must be a constructor call on a
+/// PascalCase type. Any other return shape (or a bare fallthrough) leaves
+/// the set unknown; checking then stays at runtime.
+fn fn_return_variants(body: &[Stmt]) -> Option<Vec<String>> {
+    fn go(stmts: &[Stmt], vs: &mut Vec<String>) -> bool {
+        for s in stmts {
+            match s {
+                Stmt::Return(e) => match e {
+                    Expr::Call { callee, .. } => match callee.as_ref() {
+                        Expr::Ident(n) if is_type_name(n) => {
+                            vs.push(n.clone());
+                        }
+                        _ => return false,
+                    },
+                    _ => return false,
+                },
+                Stmt::If { then_body, else_body, .. } => {
+                    if !go(then_body, vs) {
+                        return false;
+                    }
+                    if let Some(eb) = else_body {
+                        if !go(eb, vs) {
+                            return false;
+                        }
+                    }
+                }
+                Stmt::Match { arms, .. } => {
+                    for a in arms {
+                        if !go(&a.body, vs) {
+                            return false;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        true
+    }
+    let mut vs = Vec::new();
+    if go(body, &mut vs) && !vs.is_empty() {
+        Some(vs)
+    } else {
+        None
+    }
+}
+
+/// Is this identifier a type name? (PascalCase — the naming law, §5)
+fn is_type_name(n: &str) -> bool {
+    n.chars().next().is_some_and(|c| c.is_uppercase())
+}
+
+/// Top-level names a parallel body statement publishes upward (§14) —
+/// mirrors the runtime's publish rule: only `!x = ...` / `!(a, b) = ...`
+/// statements of the block's own top level publish.
+fn parallel_publishes(stmt: &Stmt) -> Vec<String> {
+    match stmt {
+        Stmt::Decl { name, .. } => vec![name.clone()],
+        Stmt::DeclTuple { names, .. } => names.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// `A | B | C` chain of PascalCase idents — a union type definition (§7.6).
+fn union_of_init(e: &Expr) -> Option<Vec<String>> {
+    fn go(e: &Expr, vs: &mut Vec<String>) -> bool {
+        match e {
+            Expr::Binary { op: BinOp::Or, l, r } => go(l, vs) && go(r, vs),
+            Expr::Ident(n) if is_type_name(n) => {
+                vs.push(n.clone());
+                true
+            }
+            _ => false,
+        }
+    }
+    let mut vs = Vec::new();
+    if go(e, &mut vs) {
+        Some(vs)
+    } else {
+        None
+    }
+}
+
+/// Static type of a declaration whose init is a plain constructor call.
+fn decl_var_ty(init: &Expr) -> VarTy {
+    if let Expr::Call { callee, .. } = init {
+        if let Expr::Ident(n) = callee.as_ref() {
+            if is_type_name(n) {
+                return VarTy::Named(n.clone());
+            }
+        }
+    }
+    VarTy::Unknown
+}
+
+/// `if x.fnType(T) as v` — the then-bind holds a value of type T (§8.2).
+fn fntype_narrow(cond: &Expr) -> VarTy {
+    if let Expr::Call { callee, args } = cond {
+        if let Expr::Field { name, .. } = callee.as_ref() {
+            if name == "fnType" {
+                if let Some(Expr::Ident(n)) = args.first() {
+                    return VarTy::Named(n.clone());
+                }
+            }
+        }
+    }
+    VarTy::Unknown
 }
 
 fn scalar_ty(t: &TypeExpr) -> bool {
@@ -159,7 +328,7 @@ fn root_ident(e: &Expr) -> Option<String> {
 }
 
 impl Checker<'_> {
-    fn declare(&mut self, name: &str, copyable: bool) -> bool {
+    fn declare(&mut self, name: &str, copyable: bool, ty: VarTy) -> bool {
         // no-shadowing law (§5.x): a decl in an inner scope that hides an
         // outer name is an error, not a warning
         for (i, s) in self.scope.iter().enumerate().rev() {
@@ -179,12 +348,13 @@ impl Checker<'_> {
         self.scope
             .last_mut()
             .unwrap()
-            .insert(name.to_string(), copyable);
+            .insert(name.to_string(), Binding { copyable, ty });
         true
     }
 
     fn lookup(&self, name: &str) -> bool {
         self.scope.iter().rev().any(|s| s.contains_key(name))
+            || self.top_decls.contains_key(name)
             || self.globals.names.contains(name)
             || AMBIENT.contains(&name)
     }
@@ -198,8 +368,18 @@ impl Checker<'_> {
         self.scope
             .iter()
             .rev()
-            .find_map(|s| s.get(name).copied())
+            .find_map(|s| s.get(name).map(|b| b.copyable))
             .unwrap_or(false)
+    }
+
+    /// Statically known type of a local binding (§7.6)
+    fn var_ty(&self, name: &str) -> VarTy {
+        self.scope
+            .iter()
+            .rev()
+            .find_map(|s| s.get(name).map(|b| b.ty.clone()))
+            .or_else(|| self.top_decls.get(name).cloned())
+            .unwrap_or(VarTy::Unknown)
     }
 
     /// Does this expression evaluate to a copyable scalar? (§15.1 —
@@ -330,17 +510,36 @@ impl Checker<'_> {
                 ..
             } => {
                 self.walk(init, true, module, fname);
+                // `!Shape = Circle | Rect` — union type definition (§7.6)
+                if let Some(vs) = union_of_init(init) {
+                    self.union_defs.insert(name.clone(), vs);
+                }
                 let copyable = ty
                     .as_ref()
                     .map(|t| scalar_ty(t))
                     .unwrap_or(false)
                     || self.copyable_expr(init);
-                self.declare(name, copyable);
+                // `!s = pickShape()` — s holds the callee's variant set (§7.6)
+                let vty = if union_of_init(init).is_some() {
+                    VarTy::Unknown // a union def itself is a type value
+                } else if let Expr::Call { callee, .. } = init {
+                    match callee.as_ref() {
+                        Expr::Ident(n) if is_type_name(n) => VarTy::Named(n.clone()),
+                        Expr::Ident(n) => match self.ret_tys.get(n) {
+                            Some(vs) => VarTy::Union(vs.clone()),
+                            None => VarTy::Unknown,
+                        },
+                        _ => VarTy::Unknown,
+                    }
+                } else {
+                    VarTy::Unknown
+                };
+                self.declare(name, copyable, vty);
             }
             Stmt::DeclTuple { names, init, .. } => {
                 self.walk(init, true, module, fname);
                 for n in names {
-                    self.declare(n, false);
+                    self.declare(n, false, VarTy::Unknown);
                 }
             }
             Stmt::Reassign {
@@ -388,7 +587,8 @@ impl Checker<'_> {
                 self.scope.push(HashMap::new());
                 if let Some(b) = bind {
                     let cp = self.copyable_expr(cond);
-                    self.declare(b, cp);
+                    let vty = fntype_narrow(cond);
+                    self.declare(b, cp, vty);
                 }
                 self.stmts(then_body, module, fname);
                 self.scope.pop();
@@ -396,7 +596,7 @@ impl Checker<'_> {
                     self.scope.push(HashMap::new());
                     if let Some(b) = else_bind {
                         let cp = self.copyable_expr(cond);
-                        self.declare(b, cp);
+                        self.declare(b, cp, VarTy::Unknown);
                     }
                     self.stmts(eb, module, fname);
                     self.scope.pop();
@@ -416,11 +616,11 @@ impl Checker<'_> {
                 self.scope.push(HashMap::new());
                 match pat {
                     ForPat::Single(n) => {
-                        self.declare(n, false);
+                        self.declare(n, false, VarTy::Unknown);
                     }
                     ForPat::Tuple(ns) => {
                         for n in ns {
-                            self.declare(n, false);
+                            self.declare(n, false, VarTy::Unknown);
                         }
                     }
                 }
@@ -457,6 +657,25 @@ impl Checker<'_> {
             }
             Stmt::Match { expr, arms, .. } => {
                 self.walk(expr, false, module, fname);
+                // compile-time exhaustiveness (§7.6) when the scrutinee's
+                // variants are statically known
+                if let Some(vs) = self.scrutinee_variants(expr) {
+                    let mut missing: Vec<String> = vs;
+                    let has_else = arms.iter().any(|a| a.ty.is_none());
+                    for a in arms {
+                        if let Some(t) = &a.ty {
+                            for cov in self.arm_covers(t, 0) {
+                                missing.retain(|m| *m != cov);
+                            }
+                        }
+                    }
+                    if !has_else && !missing.is_empty() {
+                        self.errors.push(format!(
+                            "match is not exhaustive: missing variant(s) {} — add arm(s) or an `else` (§7.6)",
+                            missing.join(", ")
+                        ));
+                    }
+                }
                 for arm in arms {
                     self.match_arm(arm, module, fname);
                 }
@@ -465,11 +684,37 @@ impl Checker<'_> {
             Stmt::Parallel { body, .. } => {
                 // parallel children share the enclosing scope — outer names
                 // are captured, not movable (§14, §15.1)
+                // §14 scoping: the block's top-level `!` declarations publish
+                // upward — a name already in the enclosing scope is a compile
+                // error, and the names exist after the join.
+                for stmt in body {
+                    for name in parallel_publishes(stmt) {
+                        if self.lookup(&name) {
+                            self.errors.push(format!(
+                                "parallel block publishes `{name}`, which already exists in the enclosing scope — parallel declarations join upward, they do not shadow (§14)"
+                            ));
+                        }
+                    }
+                }
                 self.with_captured(|c| {
                     c.scope.push(HashMap::new());
                     c.stmts(body, module, fname);
                     c.scope.pop();
                 });
+                // publish upward: the block's names live on after the join
+                for stmt in body {
+                    for name in parallel_publishes(stmt) {
+                        if !self.scope.last().unwrap().contains_key(&name) {
+                            self.scope.last_mut().unwrap().insert(
+                                name,
+                                Binding {
+                                    copyable: false,
+                                    ty: VarTy::Unknown,
+                                },
+                            );
+                        }
+                    }
+                }
             }
             Stmt::Spawn(e) => self.walk(e, true, module, fname),
             Stmt::Break | Stmt::Continue | Stmt::Use(_) => {}
@@ -479,10 +724,51 @@ impl Checker<'_> {
     fn match_arm(&mut self, arm: &MatchArm, module: &str, fname: &str) {
         self.scope.push(HashMap::new());
         if let Some(b) = &arm.bind {
-            self.declare(b, false);
+            let ty = match &arm.ty {
+                Some(TypeExpr::Named(n)) => VarTy::Named(n.clone()),
+                _ => VarTy::Unknown,
+            };
+            self.declare(b, false, ty);
         }
         self.stmts(&arm.body, module, fname);
         self.scope.pop();
+    }
+
+    /// Variants the scrutinee may hold, when statically known (§7.6).
+    fn scrutinee_variants(&self, e: &Expr) -> Option<Vec<String>> {
+        // direct call: the callee's inferred return variant set
+        if let Expr::Call { callee, .. } = e {
+            if let Expr::Ident(n) = callee.as_ref() {
+                if let Some(vs) = self.ret_tys.get(n) {
+                    return Some(vs.clone());
+                }
+            }
+        }
+        let root = root_ident(e)?;
+        match self.var_ty(&root) {
+            VarTy::Union(vs) => Some(vs),
+            VarTy::Named(n) => Some(vec![n]),
+            VarTy::Unknown => None,
+        }
+    }
+
+    /// Variants an arm's type expression covers — unions resolve through
+    /// known union definitions, depth-limited against self-referential defs.
+    fn arm_covers(&self, t: &TypeExpr, depth: usize) -> Vec<String> {
+        if depth > 16 {
+            return Vec::new();
+        }
+        match t {
+            TypeExpr::Named(n) => match self.union_defs.get(n) {
+                Some(vs) => vs.clone(),
+                None => vec![n.clone()],
+            },
+            TypeExpr::Union(vs) => vs
+                .iter()
+                .flat_map(|t| self.arm_covers(t, depth + 1))
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// `move_here`: this expression's root value flows into a new owner.
@@ -535,7 +821,11 @@ impl Checker<'_> {
             Expr::Cast { expr, .. } => self.walk(expr, false, module, fname),
             Expr::CountOf(inner) => self.walk(inner, false, module, fname),
             Expr::DeclArg { ty, var } => {
-                self.declare(var, scalar_ty(&TypeExpr::Named(ty.clone())));
+                self.declare(
+                    var,
+                    scalar_ty(&TypeExpr::Named(ty.clone())),
+                    VarTy::Unknown,
+                );
             }
             Expr::NamedArg { value, .. } => self.walk(value, true, module, fname),
             Expr::RecordType { fields } => {

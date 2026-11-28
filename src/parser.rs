@@ -18,6 +18,9 @@ pub enum Item {
     },
     /// top-level `use.foo.bar`
     Use(Vec<String>),
+    /// top-level `!Name = expr` declarations — record type definitions,
+    /// union defs, consts (SPEC §7.6 shows them at module top level)
+    TopDecl(Vec<Stmt>),
 }
 
 #[derive(Debug, Clone)]
@@ -318,6 +321,30 @@ impl Parser {
                     items.push(Item::Use(path));
                     continue;
                 }
+            }
+            // top-level `!name = ...` declarations (§7.6)
+            if matches!(self.peek(), Tok::Bang) {
+                let mut decls = Vec::new();
+                while !matches!(self.peek(), Tok::Eof) {
+                    if self.eat(&Tok::Semi) {
+                        continue;
+                    }
+                    if !matches!(self.peek(), Tok::Bang) {
+                        break;
+                    }
+                    match self.parse_stmt()? {
+                        s @ Stmt::Decl { .. } | s @ Stmt::DeclTuple { .. } => {
+                            decls.push(s)
+                        }
+                        _ => {
+                            return self
+                                .err("expected a declaration after `!` at top level")
+                        }
+                    }
+                    self.eat(&Tok::Semi);
+                }
+                items.push(Item::TopDecl(decls));
+                continue;
             }
             items.push(self.parse_fn()?);
         }
@@ -902,7 +929,7 @@ impl Parser {
                 Tok::LtEq => (BinOp::Le, 2),
                 Tok::GtEq => (BinOp::Ge, 2),
                 Tok::KwAnd => (BinOp::And, 1),
-                Tok::KwOr => (BinOp::Or, 0),
+                Tok::KwOr | Tok::Pipe => (BinOp::Or, 0),
                 Tok::Plus => (BinOp::Add, 3),
                 Tok::Minus => (BinOp::Sub, 3),
                 Tok::Star => (BinOp::Mul, 4),
