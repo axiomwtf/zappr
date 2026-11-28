@@ -2,9 +2,10 @@
 
 use crate::config::{self, Config};
 use crate::deps;
+
 use crate::interp::Vm;
 use crate::parser::{self, Program};
-use crate::value::{TypeRepr, Value};
+use crate::value::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 

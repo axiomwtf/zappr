@@ -64,7 +64,6 @@ pub struct UiRuntime {
     pub windows: Vec<Arc<Mutex<UiElement>>>,
     pub routes: Vec<Route>,
     pub navigations: Vec<String>,
-    pub next_window: u32,
     pub last_handler: Option<Arc<crate::value::FuncVal>>,
     /// frame counter — frames emit only on tick boundaries (§16.2)
     pub frame: u64,
@@ -83,7 +82,6 @@ impl UiRuntime {
             windows: Vec::new(),
             routes: Vec::new(),
             navigations: Vec::new(),
-            next_window: 1,
             last_handler: None,
             frame: 0,
             dirty: Vec::new(),

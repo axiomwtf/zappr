@@ -215,7 +215,6 @@ pub enum TypeExpr {
     Union(Vec<TypeExpr>),
     Ref(String), // &str
     Null,
-    Any, // inferred / wildcard
 }
 
 #[derive(Debug, Clone)]
@@ -410,18 +409,6 @@ impl Parser {
             }
             body.push(self.parse_stmt()?);
             // consume optional semicolon / newline handled by stmt_boundary
-            self.eat(&Tok::Semi);
-        }
-        Ok(body)
-    }
-
-    pub fn parse_stmts_until_eof(&mut self) -> Result<Vec<Stmt>, ParseError> {
-        let mut body = Vec::new();
-        while !matches!(self.peek(), Tok::Eof) {
-            if self.eat(&Tok::Semi) {
-                continue;
-            }
-            body.push(self.parse_stmt()?);
             self.eat(&Tok::Semi);
         }
         Ok(body)
@@ -954,6 +941,7 @@ impl Parser {
                 Tok::Plus => (BinOp::Add, 3),
                 Tok::Minus => (BinOp::Sub, 3),
                 Tok::Star => (BinOp::Mul, 4),
+                Tok::Slash => (BinOp::Div, 4),
                 Tok::Percent => (BinOp::Mod, 4),
                 Tok::KwAs if !self.in_if_cond => {
                     // cast: expr as Type — lowest precedence postfix.
@@ -1000,7 +988,7 @@ impl Parser {
                     expr: Box::new(e),
                 })
             }
-            Tok::KwNot => {
+            Tok::KwNot | Tok::Bang => {
                 self.bump();
                 let e = self.parse_unary()?;
                 Ok(Expr::Unary {
@@ -1320,7 +1308,7 @@ impl Parser {
     // ---------- types ----------
 
     pub fn parse_type(&mut self) -> Result<TypeExpr, ParseError> {
-        let mut ty = self.parse_type_atom()?;
+        let ty = self.parse_type_atom()?;
         // union: A | B | C → sugar for type tuple
         if matches!(self.peek(), Tok::Pipe) {
             let mut variants = vec![ty];

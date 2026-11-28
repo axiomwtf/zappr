@@ -944,7 +944,7 @@ impl Checker<'_> {
                     self.warnings.push(format!("type `{n}` is not a known type value"));
                 }
             }
-            TypeExpr::Null | TypeExpr::Any => {}
+            TypeExpr::Null => {}
         }
     }
 

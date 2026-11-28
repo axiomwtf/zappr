@@ -101,15 +101,6 @@ impl CallGraph {
         }
         seen
     }
-
-    /// Modules with at least one reachable fn — these get compiled (§12.2).
-    pub fn included_modules(&self) -> HashSet<String> {
-        let reach = self.reachable_from_main();
-        reach
-            .iter()
-            .filter_map(|q| q.rsplit_once('.').map(|(m, _)| m.to_string()))
-            .collect()
-    }
 }
 
 fn collect_stmt_calls(s: &Stmt, module: &str, out: &mut HashSet<String>) {

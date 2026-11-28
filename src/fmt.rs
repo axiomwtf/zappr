@@ -529,8 +529,8 @@ pub fn split_apply_pub(root: &Path) -> Result<(), String> {
         for (idx, l) in lines.iter().enumerate() {
             let ln = idx + 1;
             if ln < skip_until { continue; }
-            if let Some((_, s, e, _)) = moved.iter().find(|(_, s, e, _)| ln == *s) {
-                skip_until = e + 1;
+            if let Some((_, _, end, _)) = moved.iter().find(|(_, s, _, _)| ln == *s) {
+                skip_until = end + 1;
                 continue;
             }
             out_lines.push(l);

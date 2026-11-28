@@ -73,7 +73,6 @@ pub enum Value {
     Float(f64),
     Str(Arc<Mutex<String>>),
     Bool(bool),
-    Bytes(Arc<Mutex<Vec<u8>>>),
     /// unnamed tuple — also serves as list element storage via List
     Tuple(Arc<Mutex<Vec<Value>>>),
     /// named record: ordered fields, `.name` and `.0` both work
@@ -86,11 +85,6 @@ pub enum Value {
     Func(Arc<FuncVal>),
     /// a type used as a value: `!T = User`, `List(int)`
     Type(TypeRepr),
-    /// union variant tag for match narrowing — wraps a value with its variant name
-    Variant {
-        name: String,
-        inner: Box<Value>,
-    },
     Err(Arc<ErrVal>),
     /// poison values (§8.1, §9.3): wrongReturnType, missingArg, exclusiveAccess
     Poison {
@@ -137,36 +131,10 @@ pub struct FuncVal {
     pub name: String,
     /// parameter names; body evaluated by the interpreter
     pub params: Vec<String>,
-    /// optional declared param types (parallel to params)
-    pub param_types: Vec<Option<TypeRepr>>,
     /// function body AST index into program — stored as raw pointer-free id
     pub body_id: usize,
     /// captured environment for closures (scopes cloned at capture time)
     pub env: Env,
-    /// is this a builtin (native fn)
-    pub builtin: Option<BuiltinFn>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BuiltinFn {
-    PrintNl,
-    PrintRaw,
-    PrintErr,
-    PrintErrNl,
-    PrintFmt,
-    ReadInt,
-    ReadInto,
-    ReadDialogue,
-    Assert,
-    Typeof,
-    Len,
-    Str,
-    Int,
-    Float,
-    NowIso,
-    EnvGet,
-    ShellOut,
-    Exit,
 }
 
 #[derive(Debug, Default)]
@@ -260,9 +228,7 @@ impl Value {
             Value::Ui(_) => true,
             Value::Err(_) => false,
             Value::Poison { .. } => false,
-            Value::Variant { inner, .. } => inner.truthy(),
             Value::Weak(_) => true,
-            Value::Bytes(b) => !b.lock().unwrap().is_empty(),
         }
     }
 
@@ -272,7 +238,6 @@ impl Value {
             Value::Float(_) => TypeRepr::Float,
             Value::Str(_) => TypeRepr::Str,
             Value::Bool(_) => TypeRepr::Bool,
-            Value::Bytes(_) => TypeRepr::Bytes,
             Value::Tuple(t) => TypeRepr::Tuple(
                 // homogeneous unknown — element types aren't tracked; Any per slot
                 vec![TypeRepr::Any; t.lock().unwrap().len()],
@@ -289,14 +254,6 @@ impl Value {
             Value::Map(_) => TypeRepr::Map(Box::new(TypeRepr::Any), Box::new(TypeRepr::Any)),
             Value::Func(_) => TypeRepr::Func,
             Value::Type(t) => t.clone(),
-            Value::Variant { name, inner } => {
-                // variant of a union — approximate with record-ish repr
-                let _ = inner;
-                TypeRepr::Record {
-                    name: name.clone(),
-                    fields: vec![],
-                }
-            }
             Value::Err(_) => TypeRepr::Err,
             Value::Poison { .. } => TypeRepr::Poison,
             Value::Channel(_) => TypeRepr::Channel(Box::new(TypeRepr::Any)),
@@ -315,7 +272,7 @@ impl Value {
             TypeRepr::Float => matches!(self, Value::Float(_) | Value::Int(_)),
             TypeRepr::Str => matches!(self, Value::Str(_)),
             TypeRepr::Bool => matches!(self, Value::Bool(_)),
-            TypeRepr::Bytes => matches!(self, Value::Bytes(_)),
+            TypeRepr::Bytes => false,
             TypeRepr::Func => matches!(self, Value::Func(_)),
             TypeRepr::Err => matches!(self, Value::Err(_)),
             TypeRepr::Poison => matches!(self, Value::Poison { .. }),
@@ -384,7 +341,6 @@ impl Value {
             }
             Value::Str(s) => s.lock().unwrap().clone(),
             Value::Bool(b) => b.to_string(),
-            Value::Bytes(b) => format!("<{} bytes>", b.lock().unwrap().len()),
             Value::Tuple(t) => {
                 let inner = t
                     .lock().unwrap()
@@ -423,8 +379,13 @@ impl Value {
             }
             Value::Func(f) => format!("<fn {}>", f.name),
             Value::Type(t) => t.name(),
-            Value::Variant { name, inner } => format!("{name}({})", inner.display()),
-            Value::Err(e) => format!("Err({})", e.msg),
+            Value::Err(e) => {
+                if e.origin.is_empty() || e.origin == "Err" {
+                    format!("Err({})", e.msg)
+                } else {
+                    format!("Err({} — origin: {})", e.msg, e.origin)
+                }
+            }
             Value::Poison {
                 kind,
                 origin,
@@ -485,8 +446,8 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
             let (x, y) = (x.lock().unwrap(), y.lock().unwrap());
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| values_equal(a, b))
         }
-        (Value::Record { ty: tx, fields: x }, Value::Record { ty: ty, fields: y }) => {
-            tx == ty
+        (Value::Record { ty: tx, fields: x }, Value::Record { ty: ty2, fields: y }) => {
+            tx == ty2
                 && {
                     let (x, y) = (x.lock().unwrap(), y.lock().unwrap());
                     x.len() == y.len()
@@ -516,12 +477,6 @@ pub enum Num {
 }
 
 impl Num {
-    pub fn to_value(self) -> Value {
-        match self {
-            Num::Int(i) => Value::Int(i),
-            Num::Float(f) => Value::Float(f),
-        }
-    }
     pub fn as_f64(self) -> f64 {
         match self {
             Num::Int(i) => i as f64,

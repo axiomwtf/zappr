@@ -26,7 +26,7 @@ struct WlMessage {
 }
 
 #[repr(C)]
-struct WlInterface {
+pub struct WlInterface {
     name: *const c_char,
     version: c_int,
     method_count: c_int,
@@ -64,7 +64,7 @@ unsafe fn wsym<T>(lib: *mut c_void, name: &str) -> Result<T, ()> {
 
 macro_rules! cs { ($s:literal) => { concat!($s, "\0").as_ptr() as *const c_char } }
 
-struct Wl {
+pub struct Wl {
     lib: *mut c_void,
     connect: unsafe extern "C" fn(*const c_char) -> WlProxy,
     disconnect: unsafe extern "C" fn(WlProxy),
@@ -277,7 +277,7 @@ struct XdgToplevelListener {
 /* ---- connection state ---- */
 
 #[derive(Clone,Copy)]
-struct Global { name: u32, version: u32 }
+pub struct Global { name: u32, version: u32 }
 
 pub struct WConn {
     pub f: Wl,

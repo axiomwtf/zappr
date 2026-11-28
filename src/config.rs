@@ -34,9 +34,6 @@ impl YVal {
             _ => None,
         }
     }
-    pub fn get(&self, key: &str) -> Option<&YVal> {
-        self.as_map().and_then(|m| m.get(key))
-    }
 }
 
 #[derive(Debug, Clone, Default)]

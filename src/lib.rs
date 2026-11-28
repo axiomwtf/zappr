@@ -8,7 +8,7 @@
 #![allow(non_camel_case_types, non_snake_case, dead_code)]
 
 use std::ffi::{c_char, c_void, CStr};
-use std::ptr;
+
 
 /* ---------- C ABI for the interpreter↔renderer bridge ---------- */
 
@@ -197,7 +197,7 @@ fn text_h(scale: usize) -> i32 { (8 * scale) as i32 }
 #[derive(Clone, Copy)]
 struct Rect { x: i32, y: i32, w: i32, h: i32 }
 
-struct Laid {
+pub struct Laid {
     el: *mut ZUiC,
     r: Rect,
 }
@@ -492,15 +492,15 @@ fn layout_paint(g: &mut Gui, root: *mut ZUiC, t: &dyn TextOut) {
 /* ---------- click dispatch ---------- */
 
 unsafe fn fire_click(el: *mut ZUiC, invoke: ZInvokeCb) {
-    let hv = &(*el).handlers;
-    if hv.tag == Z_LIST && !hv.u.vec.is_null() {
-        let vec = &*hv.u.vec;
+    let hv = unsafe { &(*el).handlers };
+    if hv.tag == Z_LIST && !unsafe { hv.u.vec.is_null() } {
+        let vec = unsafe { &*hv.u.vec };
         if !vec.v.is_null() {
             for i in 0..vec.n {
-                let fv = &*vec.v.add(i);
+                let fv = unsafe { &*vec.v.add(i) };
                 if fv.tag == Z_FUNC {
                     if let Some(cb) = invoke {
-                        cb(&*vec.v.add(i));
+                        unsafe { cb(&*vec.v.add(i)) };
                     }
                 }
             }

@@ -3,9 +3,9 @@
 //! Native codegen (SPEC §4) consumes the same AST.
 
 use crate::parser::{
-    BinOp, Expr, ForPat, Item, MatchArm, Param, Program, Stmt, StrPart, TypeExpr, UnOp,
+    BinOp, Expr, ForPat, Item, MatchArm, Program, Stmt, StrPart, TypeExpr, UnOp,
 };
-use crate::value::{values_equal, BuiltinFn, ChannelShared, ErrVal, FuncVal, Num, PoisonKind, TypeRepr, Value};
+use crate::value::{values_equal, ChannelShared, ErrVal, FuncVal, Num, PoisonKind, TypeRepr, Value};
 use crate::value::Env as Scope;
 use std::sync::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -154,11 +154,7 @@ pub struct FnDef {
 }
 
 #[derive(Debug)]
-pub struct Module {
-    pub name: String,
-    /// top-level statements other than fns (rare — spec keeps logic in fns)
-    pub fns: Vec<usize>,
-}
+pub struct Module;
 
 impl Vm {
     pub fn new() -> Self {
@@ -401,10 +397,6 @@ impl Vm {
                 self.escape_value_seen(&inner, seen);
                 return;
             }
-            Value::Variant { inner, .. } => {
-                self.escape_value_seen(inner, seen);
-                return;
-            }
             _ => {}
         }
         let Some(key) = Self::value_key(v) else { return };
@@ -481,7 +473,6 @@ impl Vm {
     /// Load a parsed module: register its functions under its namespace.
     pub fn load_module(&mut self, module_name: &str, prog: &Program) -> Result<(), RuntimeError> {
         let module_scope = vec![Arc::new(Mutex::new(HashMap::new()))];
-        let mut fn_ids = Vec::new();
         let mut top_decls: Vec<&Stmt> = Vec::new();
         for item in &prog.items {
             match item {
@@ -510,7 +501,6 @@ impl Vm {
                         .entry(format!("{module_name}.{name}"))
                         .or_default()
                         .push(id);
-                    fn_ids.push(id);
                 }
                 Item::TopDecl(decls) => top_decls.extend(decls.iter()),
                 Item::Use(_) => {}
@@ -529,13 +519,7 @@ impl Vm {
             self.scopes = saved;
         }
         let p = self.prog_mut();
-        p.modules.insert(
-            module_name.to_string(),
-            Module {
-                name: module_name.to_string(),
-                fns: fn_ids,
-            },
-        );
+        p.modules.insert(module_name.to_string(), Module);
         Ok(())
     }
 
@@ -562,14 +546,8 @@ impl Vm {
         Some(Value::Func(Arc::new(FuncVal {
             name: format!("{module}.{fname}"),
             params: f.params.iter().map(|(n, _)| n.clone()).collect(),
-            param_types: f
-                .params
-                .iter()
-                .map(|(_, t)| t.as_ref().map(|_| TypeRepr::Any))
-                .collect(),
             body_id: id,
             env: f.env.clone(),
-            builtin: None,
         })))
     }
 
@@ -638,10 +616,8 @@ impl Vm {
         Some(Value::Func(Arc::new(FuncVal {
             name: self.prog.fns.read().unwrap()[id].name.clone(),
             params: self.prog.fns.read().unwrap()[id].params.iter().map(|(n, _)| n.clone()).collect(),
-            param_types: vec![None; self.prog.fns.read().unwrap()[id].params.len()],
             body_id: id,
             env: self.prog.fns.read().unwrap()[id].env.clone(),
-            builtin: None,
         })))
     }
 
@@ -1061,10 +1037,7 @@ impl Vm {
                     if matched {
                         self.push_scope();
                         if let Some(b) = &arm.bind {
-                            let inner = match &v {
-                                Value::Variant { inner, .. } => (**inner).clone(),
-                                _ => v.clone(),
-                            };
+                            let inner = v.clone();
                             self.declare(b, inner)?;
                         }
                         let r = self.exec_block(&arm.body);
@@ -1236,7 +1209,6 @@ impl Vm {
         match ty {
             TypeExpr::Named(name) => match v {
                 Value::Record { ty: t, .. } => t == name,
-                Value::Variant { name: n, .. } => n == name,
                 _ => false,
             },
             TypeExpr::Union(vs) => vs.iter().any(|t| self.type_expr_matches(t, v)),
@@ -1251,7 +1223,6 @@ impl Vm {
         match ty {
             TypeExpr::Named(name) => match v {
                 Value::Record { ty: t, .. } => t == name,
-                Value::Variant { name: n, .. } => n == name,
                 _ => false,
             },
             _ => {
@@ -1283,7 +1254,6 @@ impl Vm {
                 TypeRepr::Ref(Box::new(r))
             }
             TypeExpr::Null => TypeRepr::Null,
-            TypeExpr::Any => TypeRepr::Any,
             TypeExpr::Tuple(ts) => TypeRepr::Tuple(ts.iter().map(|t| self.type_expr_repr(t)).collect()),
             TypeExpr::Union(vs) => {
                 TypeRepr::Union(vs.iter().map(|t| self.type_expr_repr(t)).collect())
@@ -1467,10 +1437,8 @@ impl Vm {
                     vals.push(Value::Func(Arc::new(FuncVal {
                         name: "<lambda>".into(),
                         params: vec!["event".into()],
-                        param_types: vec![None],
                         body_id: id,
                         env: self.scopes.clone(),
-                        builtin: None,
                     })));
                     let named = Vec::new();
                     return self.eval_callee(callee, vals, named);
@@ -1504,14 +1472,8 @@ impl Vm {
             return Ok(Value::Func(Arc::new(FuncVal {
                 name: name.to_string(),
                 params: f.params.iter().map(|(n, _)| n.clone()).collect(),
-                param_types: f
-                    .params
-                    .iter()
-                    .map(|(_, t)| t.as_ref().map(|_| TypeRepr::Any))
-                    .collect(),
                 body_id: id,
                 env: f.env.clone(),
-                builtin: None,
             })));
         }
         // builtins / ambient namespaces
@@ -1520,10 +1482,8 @@ impl Vm {
                 return Ok(Value::Func(Arc::new(FuncVal {
                     name: name.to_string(),
                     params: vec![],
-                    param_types: vec![],
                     body_id: usize::MAX,
                     env: vec![],
-                    builtin: None, // resolved by name at call time
                 })));
             }
             _ => {}
@@ -1608,22 +1568,18 @@ impl Vm {
                     line: self.cur_line,
                 })
             }
-            Value::List(l) => match name {
+            Value::List(_) => match name {
                 "len" => Ok(Value::Func(Arc::new(FuncVal {
                     name: "List.len".into(),
                     params: vec![],
-                    param_types: vec![],
                     body_id: usize::MAX,
                     env: vec![],
-                    builtin: Some(BuiltinFn::Len),
                 }))),
                 "push" => Ok(Value::Func(Arc::new(FuncVal {
                     name: "List.push".into(),
                     params: vec!["v".into()],
-                    param_types: vec![],
                     body_id: usize::MAX,
                     env: vec![],
-                    builtin: Some(BuiltinFn::Len), // marker; handled specially
                 }))),
                 _ => Err(RuntimeError {
                     msg: format!("no field/method `{name}` on list"),
@@ -1640,10 +1596,8 @@ impl Vm {
                     "len" => Ok(Value::Func(Arc::new(FuncVal {
                         name: "Map.len".into(),
                         params: vec![],
-                        param_types: vec![],
                         body_id: usize::MAX,
                         env: vec![],
-                        builtin: Some(BuiltinFn::Len),
                     }))),
                     _ => Err(RuntimeError {
                         msg: format!("no field/method `{name}` on map"),
@@ -1661,10 +1615,8 @@ impl Vm {
             Value::Type(t) => Ok(Value::Func(Arc::new(FuncVal {
                 name: format!("type.{}", t.name()),
                 params: vec![],
-                param_types: vec![],
                 body_id: usize::MAX,
                 env: vec![],
-                builtin: None,
             }))),
             Value::Ui(el) => {
                 if name == "add" {
@@ -1691,10 +1643,8 @@ impl Vm {
                     return Ok(Value::Func(Arc::new(FuncVal {
                         name: "fnType".into(),
                         params: vec!["T".into()],
-                        param_types: vec![],
                         body_id: usize::MAX,
                         env: vec![],
-                        builtin: Some(BuiltinFn::PrintNl), // marker — real dispatch in eval_call_field
                     })));
                 }
                 let _ = f;
@@ -1705,10 +1655,6 @@ impl Vm {
             }
             Value::Channel(_) => Err(RuntimeError {
                 msg: "no fields on channel".into(),
-                line: self.cur_line,
-            }),
-            Value::Ui(_) => Err(RuntimeError {
-                msg: "no such field".into(),
                 line: self.cur_line,
             }),
             _ => Err(RuntimeError {
@@ -1969,20 +1915,6 @@ impl Vm {
             }
         }
         Ok(Value::Nothing)
-    }
-
-    fn eval_call_spawn(&mut self, e: &Expr) -> Result<Value, RuntimeError> {
-        if let Expr::Call { callee, args } = e {
-            let mut vals = Vec::new();
-            for a in args {
-                vals.push(self.eval(a)?);
-            }
-            for v in &vals {
-                self.escape_value(v);
-            }
-            return self.eval_callee(callee, vals, vec![]);
-        }
-        self.err("spawn expects a call".into())
     }
 
     fn eval_callee(
@@ -2734,37 +2666,6 @@ impl Vm {
         }
     }
 
-    fn render_fmt(&mut self, fmt: &str, args: &[Value]) -> String {
-        // {name} interpolation — positional/named by arg order; also {0},{1}
-        let mut out = String::new();
-        let mut chars = fmt.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '{' {
-                let mut name = String::new();
-                for c2 in chars.by_ref() {
-                    if c2 == '}' {
-                        break;
-                    }
-                    name.push(c2);
-                }
-                // try positional index then named arg display order
-                if let Ok(idx) = name.parse::<usize>() {
-                    if let Some(v) = args.get(idx) {
-                        out.push_str(&v.display());
-                        continue;
-                    }
-                }
-                // named: find arg whose... we don't have names here; use order of named args
-                // fallback: search all args for one whose display matches? Just use next unused.
-                out.push('{');
-                out.push_str(&name);
-                out.push('}');
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    }
 
     fn builtin_dispatch(&mut self, name: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
         // bare builtins called as `name(...)`
@@ -2889,7 +2790,7 @@ impl Vm {
         }
     }
 
-    fn builtin_read(&mut self, args: Vec<Value>) -> Result<Value, RuntimeError> {
+    fn builtin_read(&mut self, _args: Vec<Value>) -> Result<Value, RuntimeError> {
         use std::io::BufRead;
         let stdin = std::io::stdin();
         let mut line = String::new();
@@ -2965,10 +2866,6 @@ fn value_to_type(v: &Value) -> Option<TypeRepr> {
         }
         _ => None,
     }
-}
-
-fn f_caller_value(v: &Value) -> Result<Value, RuntimeError> {
-    Ok(v.clone())
 }
 
 fn default_for(t: &TypeRepr) -> Value {

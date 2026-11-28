@@ -195,7 +195,7 @@ impl<'a> Lexer<'a> {
         loop {
             self.skip_ws_comments2()?;
             let (line, col) = (self.line, self.col);
-            let Some(c) = self.peek() else {
+            let Some(_) = self.peek() else {
                 out.push(Token {
                     tok: Tok::Eof,
                     line,
@@ -208,7 +208,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn next_token(&mut self, line: usize, col: usize) -> Result<Tok, LexError> {
+    fn next_token(&mut self, _line: usize, _col: usize) -> Result<Tok, LexError> {
         let c = self.peek().unwrap();
         match c {
             b'0'..=b'9' => self.lex_number(),
