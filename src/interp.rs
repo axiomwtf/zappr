@@ -1353,7 +1353,13 @@ impl Vm {
             Expr::Map(entries) => {
                 let mut vals = Vec::new();
                 for (k, v) in entries {
-                    vals.push((self.eval(k)?, self.eval(v)?));
+                    // a bare-identifier key is a literal key, not a lookup —
+                    // `{name: "world"}` must not require a binding `name`
+                    let kv = match k {
+                        Expr::Ident(n) => Value::str(n.clone()),
+                        _ => self.eval(k)?,
+                    };
+                    vals.push((kv, self.eval(v)?));
                 }
                 Ok(Value::Map(Arc::new(Mutex::new(vals))))
             }
@@ -1568,23 +1574,28 @@ impl Vm {
                     line: self.cur_line,
                 })
             }
-            Value::List(_) => match name {
-                "len" => Ok(Value::Func(Arc::new(FuncVal {
-                    name: "List.len".into(),
-                    params: vec![],
-                    body_id: usize::MAX,
-                    env: vec![],
-                }))),
-                "push" => Ok(Value::Func(Arc::new(FuncVal {
-                    name: "List.push".into(),
-                    params: vec!["v".into()],
-                    body_id: usize::MAX,
-                    env: vec![],
-                }))),
-                _ => Err(RuntimeError {
-                    msg: format!("no field/method `{name}` on list"),
-                    line: self.cur_line,
-                }),
+            Value::List(l) => match name {
+                // zero-arg accessors are properties — the spec's own
+                // examples pass `list.len` bare (§14, §10)
+                "len" => Ok(Value::Int(l.lock().unwrap().len() as i128)),
+                _ => {
+                    // `.0` index access — records/tuples/lists share it (§7.3, §10)
+                    if let Some(idx) = name
+                        .strip_prefix("__idx_")
+                        .and_then(|s| s.parse::<usize>().ok())
+                    {
+                        return Ok(l
+                            .lock()
+                            .unwrap()
+                            .get(idx)
+                            .cloned()
+                            .unwrap_or(Value::Nothing));
+                    }
+                    Err(RuntimeError {
+                        msg: format!("no field/method `{name}` on list"),
+                        line: self.cur_line,
+                    })
+                }
             },
             Value::Map(m) => {
                 // zapYaml.x and map.key read as field access (§19)
@@ -1593,12 +1604,7 @@ impl Vm {
                     return Ok(v.clone());
                 }
                 match name {
-                    "len" => Ok(Value::Func(Arc::new(FuncVal {
-                        name: "Map.len".into(),
-                        params: vec![],
-                        body_id: usize::MAX,
-                        env: vec![],
-                    }))),
+                    "len" => Ok(Value::Int(m.lock().unwrap().len() as i128)),
                     _ => Err(RuntimeError {
                         msg: format!("no field/method `{name}` on map"),
                         line: self.cur_line,
@@ -1607,6 +1613,8 @@ impl Vm {
             }
             Value::Str(s) => match name {
                 "len" => Ok(Value::Int(s.lock().unwrap().chars().count() as i128)),
+                // zero-arg string methods read as properties (§14 style)
+                "upper" | "lower" | "trim" => self.method_call(obj, name, vec![]),
                 _ => Err(RuntimeError {
                     msg: format!("no field/method `{name}` on str"),
                     line: self.cur_line,
@@ -1933,16 +1941,19 @@ impl Vm {
                 if let Some(v) = self.builtin_call(None, name, &args, &named)? {
                     return Ok(v);
                 }
-                // type constructors in expression position: List(int), Map(k,v)
-                if name == "List" || name == "Map" {
+                // type constructors in expression position: List(int), Map(k,v),
+                // Box(t1, t2, ...) — a heterogeneous product type (§10)
+                if name == "List" || name == "Map" || name == "Box" {
                     let tys: Vec<TypeRepr> = args.iter().filter_map(value_to_type).collect();
                     let t = if name == "List" {
                         TypeRepr::List(Box::new(tys.first().cloned().unwrap_or(TypeRepr::Any)))
-                    } else {
+                    } else if name == "Map" {
                         TypeRepr::Map(
                             Box::new(tys.first().cloned().unwrap_or(TypeRepr::Any)),
                             Box::new(tys.get(1).cloned().unwrap_or(TypeRepr::Any)),
                         )
+                    } else {
+                        TypeRepr::Tuple(tys)
                     };
                     return Ok(Value::Type(t));
                 }
@@ -2198,6 +2209,14 @@ impl Vm {
                 })
             }
             TypeRepr::List(_) => Ok(Value::List(Arc::new(Mutex::new(args)))),
+            TypeRepr::Tuple(ts) => {
+                // Box(t1, ..., tn)(v1, ..., vn) — positional, defaults fill gaps
+                let mut out = Vec::new();
+                for (i, ty) in ts.iter().enumerate() {
+                    out.push(args.get(i).cloned().unwrap_or_else(|| default_for(ty)));
+                }
+                Ok(Value::Tuple(Arc::new(Mutex::new(out))))
+            }
             TypeRepr::Map(_, _) => {
                 // Map(k,v){} literal style or pairs
                 let mut m = Vec::new();

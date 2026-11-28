@@ -11,7 +11,7 @@ const AMBIENT: &[&str] = &[
     "print", "read", "readInto", "readDialogue", "assert", "typeof", "len", "str", "int",
     "float", "env", "clock", "nav", "ui", "route", "onClick", "weak", "channel", "spawn",
     "parallel", "zapYaml", "val", "thisShell", "math", "json", "exit", "List", "Map", "null", "true",
-    "false", "int", "float", "str", "bool", "bytes", "Err", "poison", "any", "args",
+    "false", "int", "float", "str", "bool", "bytes", "Err", "poison", "any", "args", "Box",
 ];
 
 /// Bare builtins whose arguments are only read — never moved (§15.1).
@@ -821,7 +821,11 @@ impl Checker<'_> {
             }
             Expr::Map(kvs) => {
                 for (k, v) in kvs {
-                    self.walk(k, true, module, fname);
+                    // map literal keys are literal keys, not name references —
+                    // `{name: "world"}` must not require a binding `name`
+                    if !matches!(k, Expr::Ident(_)) {
+                        self.walk(k, false, module, fname);
+                    }
                     self.walk(v, true, module, fname);
                 }
             }
