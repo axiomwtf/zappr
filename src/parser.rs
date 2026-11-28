@@ -133,7 +133,7 @@ pub struct MatchArm {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
-    Int(i64),
+    Int(i128),
     Float(f64),
     Str(Vec<StrPart>),
     Bool(bool),
