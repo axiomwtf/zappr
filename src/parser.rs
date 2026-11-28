@@ -428,6 +428,27 @@ impl Parser {
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+        // `val.field = expr` — the §19.2 build-privilege write, no `/`
+        if matches!(self.peek(), Tok::Ident(s) if s == "val")
+            && matches!(self.peek_n(1), Tok::Dot)
+            && matches!(self.peek_n(2), Tok::Ident(_))
+            && matches!(self.peek_n(3), Tok::Assign)
+        {
+            self.bump(); // val
+            self.bump(); // .
+            let ftok = self.bump();
+            let Tok::Ident(field) = ftok.tok.clone() else {
+                unreachable!("checked above")
+            };
+            self.bump(); // =
+            let value = self.parse_expr()?;
+            return Ok(Stmt::ReassignField {
+                obj: "val".into(),
+                field,
+                value,
+                line: ftok.line,
+            });
+        }
         let tok = self.peek_tok().clone();
         match &tok.tok {
             Tok::KwReturn => {

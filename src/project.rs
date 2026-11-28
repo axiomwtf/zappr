@@ -85,8 +85,18 @@ fn collect_znz(dir: &Path, base: &Path, out: &mut Vec<(String, PathBuf)>) -> Res
 }
 
 /// Load a project from `dir` (found by walking up for Zappr.yaml).
-pub fn load(dir: &Path, include_tests: bool) -> Result<Project, String> {
-    let root = find_root(dir)?;
+/// Is `rel` (root-relative, forward slashes) a registered cli: file? (§19.2)
+fn p_cli_contains(config: &crate::config::Config, rel: &str) -> bool {
+    let rel_base = Path::new(rel).file_name().and_then(|f| f.to_str());
+    config.cli.iter().any(|c| {
+        let c = c.trim_start_matches("./");
+        c == rel
+            || rel.ends_with(&format!("/{c}"))
+            || Path::new(c).file_name().and_then(|f| f.to_str()) == rel_base
+    })
+}
+
+pub fn load(dir: &Path, include_tests: bool) -> Result<Project, String> {    let root = find_root(dir)?;
     let yaml_path = root.join("Zappr.yaml");
     let yaml_src = std::fs::read_to_string(&yaml_path)
         .map_err(|e| format!("cannot read {}: {e}", yaml_path.display()))?;
@@ -122,6 +132,17 @@ pub fn load(dir: &Path, include_tests: bool) -> Result<Project, String> {
     let mut modules = Vec::new();
     for (mname, path) in files {
         if !include_tests && mname.starts_with("tests") {
+            continue;
+        }
+        // cli: files are not app modules — they load on demand as
+        // `zap <command>` with build privileges (§19.2). Skip them here so
+        // their `val.` writes never trip the app checker.
+        let rel = path
+            .strip_prefix(&root)
+            .or_else(|_| path.strip_prefix(&src_dir))
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"));
+        if p_cli_contains(&config, &rel) {
             continue;
         }
         let src = std::fs::read_to_string(&path)

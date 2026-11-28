@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 const AMBIENT: &[&str] = &[
     "print", "read", "readInto", "readDialogue", "assert", "typeof", "len", "str", "int",
     "float", "env", "clock", "nav", "ui", "route", "onClick", "weak", "channel", "spawn",
-    "parallel", "zapYaml", "thisShell", "math", "json", "exit", "List", "Map", "null", "true",
+    "parallel", "zapYaml", "val", "thisShell", "math", "json", "exit", "List", "Map", "null", "true",
     "false", "int", "float", "str", "bool", "bytes", "Err", "poison", "any", "args",
 ];
 
@@ -130,6 +130,8 @@ struct Checker<'a> {
     /// module-level `!Name = ...` declarations (§7.6) — visible to every
     /// fn in the module
     top_decls: HashMap<String, VarTy>,
+    /// `val:` writes are legal only inside a custom zap CLI module (§19.2)
+    val_writes_ok: bool,
 }
 
 pub fn check_program(prog: &Program, module: &str, globals: &GlobalSyms) -> CheckOutcome {
@@ -154,6 +156,8 @@ pub fn check_program(prog: &Program, module: &str, globals: &GlobalSyms) -> Chec
         union_defs: HashMap::new(),
         ret_tys,
         top_decls: HashMap::new(),
+        // cli modules (loaded by `zap <command>`) run with build privileges
+        val_writes_ok: module.starts_with("cli"),
     };
     // module-level declarations first: union defs and types every fn sees
     for item in &prog.items {
@@ -548,6 +552,11 @@ impl Checker<'_> {
                 if !self.lookup(target) {
                     self.errors.push(format!("`{target}` is not declared — use `!{target} =` to declare"));
                 }
+                if target == "val" && !self.val_writes_ok {
+                    self.errors.push(
+                        "val is immutable from within Zappr code — only a custom zap CLI (`cli:` in Zappr.yaml) may write val (§19.2)".into(),
+                    );
+                }
                 if let Some(v) = value {
                     self.walk(v, true, module, fname);
                 }
@@ -563,6 +572,11 @@ impl Checker<'_> {
             Stmt::ReassignField { obj, value, .. } => {
                 if !self.lookup(obj) {
                     self.errors.push(format!("`{obj}` is not declared"));
+                }
+                if obj == "val" && !self.val_writes_ok {
+                    self.errors.push(
+                        "val is immutable from within Zappr code — only a custom zap CLI (`cli:` in Zappr.yaml) may write val (§19.2)".into(),
+                    );
                 }
                 self.walk(value, true, module, fname);
                 self.borrow_conflict(obj, "field write", module, fname);

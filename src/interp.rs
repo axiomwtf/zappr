@@ -788,10 +788,16 @@ impl Vm {
                 line,
             } => {
                 self.cur_line = *line;
-                let ov = self.get(obj).ok_or_else(|| RuntimeError {
-                    msg: format!("unknown object `{obj}`"),
-                    line: *line,
-                })?;
+                // `val` is ambient — resolve like zapYaml (§19.2); the map
+                // is shared with prog, so the write reaches the CLI's
+                // write-back
+                let ov = match obj.as_str() {
+                    "val" | "zapYaml" => self.prog.zap_yaml.clone(),
+                    _ => self.get(obj).ok_or_else(|| RuntimeError {
+                        msg: format!("unknown object `{obj}`"),
+                        line: *line,
+                    })?,
+                };
                 let vv = self.eval(value)?;
                 self.field_set(&ov, field, vv).map_err(|m| RuntimeError {
                     msg: m,
@@ -1518,6 +1524,12 @@ impl Vm {
             _ => {}
         }
         if name == "zapYaml" {
+            return Ok(self.prog.zap_yaml.clone());
+        }
+        if name == "val" {
+            // §19.2: val is the same tree as zapYaml — readable everywhere,
+            // writable only inside a custom zap CLI (the map is shared, so
+            // field writes mutate it and the CLI's caller persists them)
             return Ok(self.prog.zap_yaml.clone());
         }
         self.get(name).ok_or_else(|| RuntimeError {

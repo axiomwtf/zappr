@@ -91,10 +91,9 @@ fn cmd_custom(cmd: &str, rest: &[String]) -> Result<(), String> {
         let prog = parser::parse(&src).map_err(|e| {
             format!("{}:{}:{}: parse error: {}", path.display(), e.line, e.col, e.msg)
         })?;
-        let has = prog.items.iter().any(|it| {
+        if !prog.items.iter().any(|it| {
             matches!(it, parser::Item::Fn { name, .. } if name == cmd)
-        });
-        if !has {
+        }) {
             continue;
         }
         let stem = Path::new(rel)
@@ -107,15 +106,209 @@ fn cmd_custom(cmd: &str, rest: &[String]) -> Result<(), String> {
                 .filter(|c| c.is_alphanumeric())
                 .collect::<String>()
         );
+        // the cli module gets checked like any module — its `val.` writes
+        // are the one legal mutation path (§19.2)
+        let mut progs: Vec<(&str, &parser::Program)> = p
+            .modules
+            .iter()
+            .map(|(m, _, pr)| (m.as_str(), pr))
+            .collect();
+        progs.push((modname.as_str(), &prog));
+        let globals = crate::checker::GlobalSyms::from_programs(progs.into_iter());
+        let out = crate::checker::check_program(&prog, &modname, &globals);
+        for w in &out.warnings {
+            eprintln!("zap: {w}");
+        }
+        if !out.errors.is_empty() {
+            return Err(format!(
+                "{}: check failed:\n  {}",
+                path.display(),
+                out.errors.join("\n  ")
+            ));
+        }
         vm.load_module(&modname, &prog)
             .map_err(|e| format!("cli module `{modname}`: {}", e.msg))?;
         vm.set_cli_args(rest.to_vec());
         return match vm.call_named(cmd, Vec::new()) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                // §19.2: the command ran with build privileges — persist
+                // any `val.` writes back into Zappr.yaml
+                write_back_vals(&p.root, &vm.prog.zap_yaml)?;
+                Ok(())
+            }
             Err(e) => Err(format!("`{cmd}` failed: {}", e.msg)),
         };
     }
     Err(format!("unknown command `{cmd}` — see `zap --help`"))
+}
+
+/// §19.2: a custom zap CLI runs with build privileges — `val.` writes
+/// persist back into Zappr.yaml's `val:` block when the command finishes.
+fn write_back_vals(root: &Path, vals: &crate::value::Value) -> Result<(), String> {
+    let yv = value_to_yval(vals);
+    let path = root.join("Zappr.yaml");
+    let src = std::fs::read_to_string(&path).map_err(|e| format!("Zappr.yaml: {e}"))?;
+    let out = splice_val_block(&src, &yv);
+    if out != src {
+        std::fs::write(&path, out).map_err(|e| format!("Zappr.yaml: {e}"))?;
+    }
+    Ok(())
+}
+
+fn value_to_yval(v: &crate::value::Value) -> crate::config::YVal {
+    use crate::config::YVal;
+    match v {
+        crate::value::Value::Str(s) => YVal::Str(s.lock().unwrap().clone()),
+        crate::value::Value::Int(i) => YVal::Int(*i as i64),
+        crate::value::Value::Float(f) => YVal::Float(*f),
+        crate::value::Value::Bool(b) => YVal::Bool(*b),
+        crate::value::Value::List(l) => {
+            YVal::Seq(l.lock().unwrap().iter().map(value_to_yval).collect())
+        }
+        crate::value::Value::Map(m) => {
+            let mut out = std::collections::BTreeMap::new();
+            for (k, v) in m.lock().unwrap().iter() {
+                if let crate::value::Value::Str(ks) = k {
+                    out.insert(ks.lock().unwrap().clone(), value_to_yval(v));
+                }
+            }
+            YVal::Map(out)
+        }
+        _ => YVal::Null,
+    }
+}
+
+/// Replace (or append) the `val:` block in Zappr.yaml, preserving the rest.
+fn splice_val_block(src: &str, vals: &crate::config::YVal) -> String {
+    let block = emit_val_block(vals);
+    let mut out = String::new();
+    let mut in_val = false;
+    let mut replaced = false;
+    for line in src.lines() {
+        let top = !line.starts_with([' ', '\t', '-']) && !line.trim().is_empty();
+        if top && line.trim_start().starts_with("val:") {
+            in_val = true;
+            out.push_str(&block);
+            replaced = true;
+            continue;
+        }
+        if in_val {
+            if top {
+                in_val = false;
+                out.push_str(line);
+                out.push('\n');
+            }
+            continue; // drop the old val block
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !replaced {
+        out.push_str(&block);
+    }
+    out
+}
+
+fn emit_val_block(vals: &crate::config::YVal) -> String {
+    let mut s = String::from("val:\n");
+    match vals {
+        crate::config::YVal::Map(m) => {
+            if m.is_empty() {
+                return "val: {}\n".into();
+            }
+            for (k, v) in m {
+                emit_yval(&mut s, k, v, 2);
+            }
+        }
+        crate::config::YVal::Null => return "val: {}\n".into(),
+        _ => s.push_str(" {}\n"),
+    }
+    s
+}
+
+fn emit_yval(out: &mut String, key: &str, v: &crate::config::YVal, indent: usize) {
+    let pad = " ".repeat(indent);
+    match v {
+        crate::config::YVal::Map(m) => {
+            if m.is_empty() {
+                out.push_str(&format!("{pad}{key}: {{}}\n"));
+                return;
+            }
+            out.push_str(&format!("{pad}{key}:\n"));
+            for (k, v) in m {
+                emit_yval(out, k, v, indent + 2);
+            }
+        }
+        crate::config::YVal::Seq(s) => {
+            if s.is_empty() {
+                out.push_str(&format!("{pad}{key}: []\n"));
+                return;
+            }
+            out.push_str(&format!("{pad}{key}:\n"));
+            for item in s {
+                emit_seq_item(out, item, indent + 2);
+            }
+        }
+        _ => out.push_str(&format!("{pad}{key}: {}\n", scalar_yaml(v))),
+    }
+}
+
+fn emit_seq_item(out: &mut String, v: &crate::config::YVal, indent: usize) {
+    let pad = " ".repeat(indent);
+    match v {
+        crate::config::YVal::Map(m) => {
+            let mut it = m.iter();
+            match it.next() {
+                Some((k, first)) => match first {
+                    crate::config::YVal::Map(_) | crate::config::YVal::Seq(_) => {
+                        out.push_str(&format!("{pad}- {k}:\n"));
+                        emit_yval(out, k, first, indent + 4);
+                    }
+                    _ => out.push_str(&format!("{pad}- {k}: {}\n", scalar_yaml(first))),
+                },
+                None => out.push_str(&format!("{pad}- {{}}\n")),
+            }
+            for (k, v) in it {
+                emit_yval(out, k, v, indent + 2);
+            }
+        }
+        crate::config::YVal::Seq(s) => {
+            out.push_str(&format!("{pad}-\n"));
+            for item in s {
+                emit_seq_item(out, item, indent + 2);
+            }
+        }
+        _ => out.push_str(&format!("{pad}- {}\n", scalar_yaml(v))),
+    }
+}
+
+fn scalar_yaml(v: &crate::config::YVal) -> String {
+    match v {
+        crate::config::YVal::Str(s) => {
+            let needs_quote = s.is_empty()
+                || s.contains(": ")
+                || s.contains(" #")
+                || s.trim() != s
+                || s.contains('\n')
+                || s.starts_with([
+                    '{', '[', '&', '*', '!', '|', '>', '\'', '"', '%', '@', '`', '-',
+                ])
+                || s.parse::<f64>().is_ok()
+                || matches!(s.as_str(), "true" | "false" | "null" | "yes" | "no");
+            if needs_quote {
+                format!(
+                    "\"{}\"",
+                    s.replace('\\', "\\\\").replace('"', "\\\"")
+                )
+            } else {
+                s.clone()
+            }
+        }
+        crate::config::YVal::Int(i) => i.to_string(),
+        crate::config::YVal::Float(f) => format!("{f}"),
+        crate::config::YVal::Bool(b) => b.to_string(),
+        _ => String::new(),
+    }
 }
 
 /// Run an embedded project extracted from the artifact tail.
